@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Weather Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="container">
+    <h1>Weather Dashboard</h1>
+    <form id="searchForm">
+      <input id="query" type="text" placeholder="City or address (e.g. London)" required />
+      <button type="submit">Search</button>
+      <select id="days">
+        <option value="3">3 days</option>
+        <option value="5">5 days</option>
+        <option value="7" selected>7 days</option>
+      </select>
+    </form>
+
+    <div id="info" class="card hidden"></div>
+
+    <canvas id="tempChart" class="card hidden"></canvas>
+
+    <div id="daily" class="grid"></div>
+  </div>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
