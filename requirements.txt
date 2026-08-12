@@ -1,6 +1,4 @@
 python-telegram-bot>=22.0
 google-generativeai>=0.8.5
 aiohttp>=3.10.0
-gradio_client>=1.0.0
-huggingface_hub>=0.30.0
 Pillow>=10.0.0
