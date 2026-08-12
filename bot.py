@@ -8,7 +8,8 @@ from pathlib import Path
 
 import aiohttp
 import google.generativeai as genai
-from gradio_client import Client
+
+from gradio_client import Client, handle_file
 
 from telegram import (
     Update,
@@ -25,6 +26,7 @@ from telegram.ext import (
     filters,
 )
 
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -33,34 +35,65 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 OWNER_ID = 8904429775
 
+
 # ============================================================
 # GLOBAL SETTINGS
 # ============================================================
 
 settings = {
+    # TEXT
     "gemini_model": "gemini-3.5-flash",
 
+    # IMAGE
     "image_model": "flux-schnell",
 
+    # VIDEO
+    "video_model": "wan2.2-fast",
+
+    # ROLE
     "system_prompt": (
         "Ты полезный AI-ассистент в Telegram. "
         "Отвечай понятно, точно и на языке пользователя."
     ),
 
-    # True = отвечать на все сообщения
-    # False = только %
+    # True:
+    # отвечает на все сообщения
+    #
+    # False:
+    # отвечает только если сообщение начинается с %
     "reply_all": False,
 
+    # HISTORY
+    #
     # 0 = без лимита
     # 1 = ничего не помнить
+    # N = помнить последние N сообщений
     "history_limit": 20,
 
+    # API
     "gemini_api_key": "",
     "pixazo_api_key": "",
-
-    # HF token необязателен
     "hf_token": "",
 }
+
+
+# ============================================================
+# VIDEO SPACES
+# ============================================================
+
+VIDEO_SPACES = [
+    {
+        "name": "Wan2.2 14B Fast",
+        "space": "zerogpu-aoti/wan2-2-fp8da-aoti-faster",
+        "kind": "wan_i2v",
+    },
+    {
+        "name": "Wan2.2 14B Fast Preview",
+        "space": "r3gm/wan2-2-fp8da-aoti-preview-2c",
+        "kind": "wan_i2v",
+    },
+]
+
 
 # ============================================================
 # HISTORY
@@ -73,9 +106,11 @@ def add_history(chat_id, role, text):
 
     limit = settings["history_limit"]
 
+    # 1 = вообще ничего не помнить
     if limit == 1:
         return
 
+    # 0 = без лимита
     if limit == 0:
         histories[chat_id].append({
             "role": role,
@@ -83,6 +118,7 @@ def add_history(chat_id, role, text):
         })
         return
 
+    # N
     histories[chat_id] = deque(
         histories[chat_id],
         maxlen=limit,
@@ -126,7 +162,7 @@ def configure_gemini():
     if not key:
         raise RuntimeError(
             "Gemini API ключ не установлен.\n"
-            "Открой /settings → API ключи."
+            "Открой /settings → 🔑 API ключи."
         )
 
     genai.configure(api_key=key)
@@ -258,7 +294,7 @@ async def gemini_media(
 
 
 # ============================================================
-# PIXAZO IMAGE
+# PIXAZO
 # ============================================================
 
 PIXAZO_URL = (
@@ -336,20 +372,15 @@ async def generate_image(prompt):
 
 
 # ============================================================
-# VIDEO
+# GRADIO HELPERS
 # ============================================================
 
-VIDEO_SPACES = [
-    "Lightricks/ltx-2-distilled",
-    "Lightricks/ltx-2",
-]
+def make_gradio_client(space):
 
-
-def _client(space):
-
-    token = settings.get("hf_token")
+    token = settings.get("hf_token", "").strip()
 
     if token:
+
         try:
             return Client(
                 space,
@@ -361,175 +392,612 @@ def _client(space):
     return Client(space)
 
 
-def video_from_result(result):
+def get_api_info(client):
 
-    if isinstance(result, (list, tuple)):
+    """
+    Получает реальную информацию об API Space.
 
-        for item in result:
+    Это важно:
+    мы НЕ угадываем api_name.
+    """
 
-            if isinstance(item, str):
+    try:
+
+        return client.view_api(
+            all_endpoints=True,
+            return_format="dict",
+        )
+
+    except TypeError:
+
+        # Для старых версий gradio_client
+        return client.view_api(
+            all_endpoints=True,
+        )
+
+
+def normalize_endpoint_name(name):
+
+    if not name:
+        return ""
+
+    name = str(name)
+
+    if not name.startswith("/"):
+        name = "/" + name
+
+    return name
+
+
+def find_video_endpoint(api_info):
+
+    """
+    Автоматически ищет endpoint,
+    связанный с video generation.
+    """
+
+    if not api_info:
+        return None, None
+
+    endpoints = {}
+
+    if isinstance(api_info, dict):
+
+        # Новый формат может выглядеть:
+        #
+        # {
+        #   "named_endpoints": {
+        #       "/generate": {...}
+        #   }
+        # }
+
+        named = api_info.get(
+            "named_endpoints"
+        )
+
+        if isinstance(named, dict):
+            endpoints.update(named)
+
+        # Иногда endpoint-ы находятся
+        # непосредственно в словаре.
+
+        for key, value in api_info.items():
+
+            if isinstance(value, dict):
 
                 if (
-                    item.endswith(".mp4")
-                    or item.endswith(".webm")
-                    or item.endswith(".mov")
+                    "parameters" in value
+                    or "inputs" in value
+                    or "input" in value
                 ):
-                    return item
+                    endpoints[str(key)] = value
 
-            if isinstance(item, dict):
+    # Если ничего не нашли
+    if not endpoints:
+        return None, None
 
-                path = (
-                    item.get("path")
-                    or item.get("video")
-                    or item.get("url")
-                )
+    best = None
+    best_score = -999
 
-                if path:
-                    return path
+    for endpoint_name, endpoint_data in endpoints.items():
 
-        if result:
-            return result[0]
+        endpoint_text = (
+            str(endpoint_name)
+            + " "
+            + str(endpoint_data)
+        ).lower()
+
+        score = 0
+
+        # Сильные признаки генерации
+        if "video" in endpoint_text:
+            score += 10
+
+        if "generate" in endpoint_text:
+            score += 8
+
+        if "predict" in endpoint_text:
+            score += 2
+
+        if "image" in endpoint_text:
+            score += 3
+
+        if "prompt" in endpoint_text:
+            score += 4
+
+        if "duration" in endpoint_text:
+            score += 3
+
+        if "seed" in endpoint_text:
+            score += 2
+
+        if "negative_prompt" in endpoint_text:
+            score += 1
+
+        if score > best_score:
+
+            best_score = score
+
+            best = (
+                normalize_endpoint_name(
+                    endpoint_name
+                ),
+                endpoint_data,
+            )
+
+    return best
+
+
+def endpoint_parameters(endpoint_data):
+
+    """
+    Достаёт список параметров endpoint.
+    """
+
+    if not isinstance(
+        endpoint_data,
+        dict,
+    ):
+        return []
+
+    params = (
+        endpoint_data.get("parameters")
+        or endpoint_data.get("inputs")
+        or []
+    )
+
+    if isinstance(params, dict):
+        return list(params.items())
+
+    return params
+
+
+def parameter_name(param, index):
+
+    if isinstance(param, dict):
+
+        return (
+            param.get("parameter_name")
+            or param.get("name")
+            or param.get("label")
+            or f"arg_{index}"
+        )
+
+    return f"arg_{index}"
+
+
+def parameter_default(param):
+
+    if not isinstance(
+        param,
+        dict,
+    ):
+        return None
+
+    return (
+        param.get("parameter_default")
+        if "parameter_default" in param
+        else param.get("default")
+    )
+
+
+def parameter_optional(param):
+
+    if not isinstance(
+        param,
+        dict,
+    ):
+        return False
+
+    return bool(
+        param.get(
+            "parameter_has_default",
+            False,
+        )
+        or param.get(
+            "optional",
+            False,
+        )
+    )
+
+
+# ============================================================
+# WAN2.2 AUTO CALL
+# ============================================================
+
+def build_wan_arguments(
+    endpoint_data,
+    prompt,
+):
+    """
+    Автоматически строит аргументы
+    по названиям параметров Gradio API.
+
+    Нам НЕ нужно знать точный порядок.
+    """
+
+    params = endpoint_parameters(
+        endpoint_data
+    )
+
+    kwargs = {}
+
+    seed = random.randint(
+        1,
+        2_000_000_000,
+    )
+
+    for index, param in enumerate(params):
+
+        name = parameter_name(
+            param,
+            index,
+        )
+
+        lname = name.lower()
+
+        # ----------------------------------------------------
+        # IMAGE
+        # ----------------------------------------------------
+
+        if (
+            "input_image" in lname
+            or lname in {
+                "image",
+                "img",
+                "init_image",
+                "start_image",
+            }
+        ):
+
+            # Wan2.2 Fast требует изображение.
+            #
+            # Здесь создаём минимальный
+            # placeholder через PIL.
+            #
+            # Пользовательский prompt всё равно
+            # передаётся отдельно.
+
+            from PIL import Image
+
+            placeholder = Image.new(
+                "RGB",
+                (512, 512),
+                "gray",
+            )
+
+            kwargs[name] = placeholder
+
+        # ----------------------------------------------------
+        # PROMPT
+        # ----------------------------------------------------
+
+        elif (
+            "prompt" in lname
+            and "negative" not in lname
+        ):
+
+            kwargs[name] = prompt
+
+        # ----------------------------------------------------
+        # NEGATIVE PROMPT
+        # ----------------------------------------------------
+
+        elif "negative_prompt" in lname:
+
+            kwargs[name] = (
+                "blurry, low quality, "
+                "distorted, watermark"
+            )
+
+        # ----------------------------------------------------
+        # DURATION
+        # ----------------------------------------------------
+
+        elif (
+            "duration" in lname
+            or "seconds" in lname
+        ):
+
+            kwargs[name] = 2.0
+
+        # ----------------------------------------------------
+        # SEED
+        # ----------------------------------------------------
+
+        elif lname == "seed":
+
+            kwargs[name] = seed
+
+        elif (
+            "randomize_seed" in lname
+            or "random_seed" in lname
+        ):
+
+            kwargs[name] = True
+
+        # ----------------------------------------------------
+        # STEPS
+        # ----------------------------------------------------
+
+        elif (
+            "steps" in lname
+            or "inference_steps" in lname
+        ):
+
+            # Fast Wan обычно работает
+            # на небольшом количестве steps.
+            kwargs[name] = 4
+
+        # ----------------------------------------------------
+        # GUIDANCE
+        # ----------------------------------------------------
+
+        elif (
+            "guidance_scale" in lname
+            or lname == "cfg"
+        ):
+
+            default = parameter_default(
+                param
+            )
+
+            if default is not None:
+                kwargs[name] = default
+            else:
+                kwargs[name] = 5.0
+
+        # ----------------------------------------------------
+        # HEIGHT
+        # ----------------------------------------------------
+
+        elif lname == "height":
+
+            kwargs[name] = 512
+
+        # ----------------------------------------------------
+        # WIDTH
+        # ----------------------------------------------------
+
+        elif lname == "width":
+
+            kwargs[name] = 512
+
+        # ----------------------------------------------------
+        # FPS
+        # ----------------------------------------------------
+
+        elif "fps" in lname:
+
+            default = parameter_default(
+                param
+            )
+
+            if default is not None:
+                kwargs[name] = default
+
+        # ----------------------------------------------------
+        # OTHER BOOLEAN OPTIONS
+        # ----------------------------------------------------
+
+        elif (
+            lname.startswith("enhance")
+            or lname.startswith("random")
+        ):
+
+            default = parameter_default(
+                param
+            )
+
+            if default is not None:
+                kwargs[name] = default
+
+        # ----------------------------------------------------
+        # DEFAULT
+        # ----------------------------------------------------
+
+        else:
+
+            default = parameter_default(
+                param
+            )
+
+            if default is not None:
+                kwargs[name] = default
+
+    return kwargs
+
+
+def extract_video(result):
+
+    """
+    Извлекает путь к видео
+    из результата Gradio.
+    """
+
+    if result is None:
+        return None
+
+    if isinstance(
+        result,
+        (str, Path),
+    ):
+
+        value = str(result)
+
+        if (
+            value.startswith("http://")
+            or value.startswith("https://")
+            or os.path.exists(value)
+            or ".mp4" in value.lower()
+            or ".webm" in value.lower()
+            or ".mov" in value.lower()
+        ):
+            return value
 
     if isinstance(result, dict):
 
-        return (
-            result.get("path")
-            or result.get("video")
-            or result.get("url")
-        )
+        # Gradio FileData
 
-    return result
+        for key in (
+            "path",
+            "url",
+            "video",
+            "file",
+        ):
 
+            value = result.get(key)
+
+            if value:
+                return value
+
+        # nested
+        for value in result.values():
+
+            found = extract_video(
+                value
+            )
+
+            if found:
+                return found
+
+    if isinstance(
+        result,
+        (list, tuple),
+    ):
+
+        for item in result:
+
+            found = extract_video(
+                item
+            )
+
+            if found:
+                return found
+
+    return None
+
+
+# ============================================================
+# VIDEO
+# ============================================================
 
 def generate_video_sync(prompt):
 
     errors = []
 
-    for space in VIDEO_SPACES:
+    for item in VIDEO_SPACES:
+
+        space_name = item["name"]
+        space_id = item["space"]
 
         try:
 
-            client = _client(space)
-
-            # Получаем информацию об API Space.
-            # Это позволяет не полагаться на старый
-            # жёстко заданный endpoint.
-
-            try:
-                api_info = client.view_api(
-                    all_endpoints=True
-                )
-            except Exception:
-                api_info = None
-
             logging.info(
-                "Trying video Space: %s",
-                space,
+                "Connecting to video Space: %s",
+                space_id,
+            )
+
+            client = make_gradio_client(
+                space_id
             )
 
             # ------------------------------------------------
-            # LTX-2 distilled
+            # GET REAL API
             # ------------------------------------------------
 
-            if space == "Lightricks/ltx-2-distilled":
+            api_info = get_api_info(
+                client
+            )
 
-                seed = random.randint(
-                    1,
-                    2_000_000_000,
+            logging.info(
+                "API info for %s: %s",
+                space_id,
+                api_info,
+            )
+
+            endpoint_name, endpoint_data = (
+                find_video_endpoint(
+                    api_info
+                )
+            )
+
+            if not endpoint_name:
+
+                raise RuntimeError(
+                    "Не найден video endpoint. "
+                    "API Space не предоставил "
+                    "подходящий endpoint."
                 )
 
-                # Актуальная функция Space:
-                #
-                # input_image
-                # prompt
-                # duration
-                # seed
-                # randomize_seed
-                # height
-                #
-                # Используем именованные аргументы,
-                # чтобы порядок не ломался.
-
-                try:
-
-                    result = client.predict(
-                        input_image=None,
-                        prompt=prompt,
-                        duration=3.0,
-                        seed=seed,
-                        randomize_seed=True,
-                        height=576,
-                        api_name="/generate_video",
-                    )
-
-                except Exception as first_error:
-
-                    logging.warning(
-                        "Named call failed: %s",
-                        first_error,
-                    )
-
-                    # Некоторые версии Space
-                    # публикуют endpoint без slash.
-
-                    result = client.predict(
-                        None,
-                        prompt,
-                        3.0,
-                        seed,
-                        True,
-                        576,
-                        api_name="generate_video",
-                    )
-
-                video = video_from_result(
-                    result
-                )
-
-                if video:
-                    return video
+            logging.info(
+                "Selected endpoint: %s",
+                endpoint_name,
+            )
 
             # ------------------------------------------------
-            # Fallback
+            # BUILD ARGUMENTS
             # ------------------------------------------------
 
-            elif space == "Lightricks/ltx-2":
+            kwargs = build_wan_arguments(
+                endpoint_data,
+                prompt,
+            )
 
-                seed = random.randint(
-                    1,
-                    2_000_000_000,
+            logging.info(
+                "Calling %s with kwargs: %s",
+                endpoint_name,
+                list(kwargs.keys()),
+            )
+
+            # ------------------------------------------------
+            # SUBMIT
+            # ------------------------------------------------
+
+            job = client.submit(
+                api_name=endpoint_name,
+                **kwargs,
+            )
+
+            # ------------------------------------------------
+            # WAIT
+            # ------------------------------------------------
+
+            result = job.result()
+
+            video = extract_video(
+                result
+            )
+
+            if not video:
+
+                raise RuntimeError(
+                    "Space завершил запрос, "
+                    "но видеофайл не найден "
+                    f"в результате: {result}"
                 )
 
-                result = client.predict(
-                    input_image=None,
-                    prompt=prompt,
-                    duration=3.0,
-                    seed=seed,
-                    randomize_seed=True,
-                    height=576,
-                    api_name="/generate_video",
-                )
+            logging.info(
+                "Video result: %s",
+                video,
+            )
 
-                video = video_from_result(
-                    result
-                )
-
-                if video:
-                    return video
+            return video
 
         except Exception as e:
 
             logging.exception(
                 "Video Space failed: %s",
-                space,
+                space_id,
             )
 
             errors.append(
-                f"{space}: {e}"
+                f"• {space_name}: {e}"
             )
 
     raise RuntimeError(
-        "Все бесплатные video Space недоступны.\n\n"
+        "Все бесплатные video Space "
+        "недоступны.\n\n"
         + "\n\n".join(errors)
     )
 
@@ -611,11 +1079,14 @@ async def settings_command(
     context,
 ):
 
-    if update.effective_user.id != OWNER_ID:
+    if (
+        update.effective_user.id
+        != OWNER_ID
+    ):
 
         await update.message.reply_text(
-            "❌ Только владелец бота может "
-            "менять настройки."
+            "❌ Только владелец бота "
+            "может менять настройки."
         )
 
         return
@@ -630,8 +1101,7 @@ async def settings_command(
         f"🖼 Фото: "
         f"{settings['image_model']}\n"
 
-        "🎬 Видео: "
-        "LTX-2 Distilled\n\n"
+        "🎬 Видео: Wan2.2 14B Fast\n\n"
 
         "⚡ Реагировать на всё: "
         f"{'ВКЛ' if settings['reply_all'] else 'ВЫКЛ'}\n"
@@ -646,7 +1116,7 @@ async def settings_command(
 
 
 # ============================================================
-# CALLBACK
+# SETTINGS CALLBACK
 # ============================================================
 
 async def settings_callback(
@@ -658,7 +1128,10 @@ async def settings_callback(
 
     await query.answer()
 
-    if query.from_user.id != OWNER_ID:
+    if (
+        query.from_user.id
+        != OWNER_ID
+    ):
 
         await query.edit_message_text(
             "❌ Нет доступа."
@@ -668,22 +1141,35 @@ async def settings_callback(
 
     data = query.data
 
+    # --------------------------------------------------------
+    # REPLY ON
+    # --------------------------------------------------------
+
     if data == "reply_on":
 
         settings["reply_all"] = True
 
         await query.edit_message_text(
-            "✅ Теперь бот отвечает на все сообщения."
+            "✅ Бот теперь реагирует "
+            "на все сообщения."
         )
+
+    # --------------------------------------------------------
+    # REPLY OFF
+    # --------------------------------------------------------
 
     elif data == "reply_off":
 
         settings["reply_all"] = False
 
         await query.edit_message_text(
-            "✅ Теперь бот отвечает только "
-            "на сообщения с `%`."
+            "✅ Бот теперь реагирует "
+            "только на сообщения с `%`."
         )
+
+    # --------------------------------------------------------
+    # CLEAR HISTORY
+    # --------------------------------------------------------
 
     elif data == "clear_history":
 
@@ -692,6 +1178,10 @@ async def settings_callback(
         await query.edit_message_text(
             "🗑 История всех чатов очищена."
         )
+
+    # --------------------------------------------------------
+    # GEMINI MODEL
+    # --------------------------------------------------------
 
     elif data == "gemini_model":
 
@@ -706,25 +1196,40 @@ async def settings_callback(
             "Отмена: /cancel"
         )
 
+    # --------------------------------------------------------
+    # IMAGE MODEL
+    # --------------------------------------------------------
+
     elif data == "image_model":
 
         await query.edit_message_text(
-            "🖼 Фото\n\n"
-            "Сейчас используется:\n"
+            "🖼 Генерация фото\n\n"
+            "Сейчас:\n"
             "Flux Schnell через Pixazo."
         )
+
+    # --------------------------------------------------------
+    # VIDEO MODEL
+    # --------------------------------------------------------
 
     elif data == "video_model":
 
         await query.edit_message_text(
-            "🎬 Видео\n\n"
-            "Основная модель:\n"
-            "LTX-2 Distilled\n\n"
-            "Если Space недоступен, бот "
-            "попробует fallback Space.\n\n"
-            "Генерация выполняется через "
-            "бесплатный Hugging Face ZeroGPU."
+            "🎬 Генерация видео\n\n"
+
+            "Основная:\n"
+            "Wan2.2 14B Fast\n\n"
+
+            "Fallback:\n"
+            "Wan2.2 14B Fast Preview\n\n"
+
+            "API Gradio определяется "
+            "автоматически."
         )
+
+    # --------------------------------------------------------
+    # SYSTEM PROMPT
+    # --------------------------------------------------------
 
     elif data == "system_prompt":
 
@@ -738,6 +1243,10 @@ async def settings_callback(
             "Ты эксперт по Python.\n\n"
             "Отмена: /cancel"
         )
+
+    # --------------------------------------------------------
+    # HISTORY
+    # --------------------------------------------------------
 
     elif data == "history":
 
@@ -753,6 +1262,10 @@ async def settings_callback(
             "20 — последние 20\n\n"
             "Отправь число."
         )
+
+    # --------------------------------------------------------
+    # API KEYS
+    # --------------------------------------------------------
 
     elif data == "api_keys":
 
@@ -772,9 +1285,7 @@ async def settings_callback(
             "Hugging Face:\n"
             "hf: hf_ТВОЙ_КЛЮЧ\n\n"
 
-            "HF Token необязателен.\n"
-            "Он может повысить приоритет "
-            "в ZeroGPU.\n\n"
+            "HF Token необязателен.\n\n"
 
             "Отмена: /cancel"
         )
@@ -789,7 +1300,10 @@ async def settings_input(
     context,
 ):
 
-    if update.effective_user.id != OWNER_ID:
+    if (
+        update.effective_user.id
+        != OWNER_ID
+    ):
         return
 
     waiting = context.user_data.get(
@@ -801,6 +1315,10 @@ async def settings_input(
 
     text = update.message.text.strip()
 
+    # --------------------------------------------------------
+    # GEMINI MODEL
+    # --------------------------------------------------------
+
     if waiting == "gemini_model":
 
         settings["gemini_model"] = text
@@ -811,8 +1329,12 @@ async def settings_input(
         )
 
         await update.message.reply_text(
-            f"✅ Gemini модель установлена:\n{text}"
+            f"✅ Gemini модель:\n{text}"
         )
+
+    # --------------------------------------------------------
+    # ROLE
+    # --------------------------------------------------------
 
     elif waiting == "system_prompt":
 
@@ -827,9 +1349,14 @@ async def settings_input(
             "✅ Роль установлена."
         )
 
+    # --------------------------------------------------------
+    # HISTORY
+    # --------------------------------------------------------
+
     elif waiting == "history":
 
         try:
+
             value = int(text)
 
             if value < 0:
@@ -838,7 +1365,8 @@ async def settings_input(
         except ValueError:
 
             await update.message.reply_text(
-                "❌ Нужно отправить целое число."
+                "❌ Нужно отправить "
+                "целое число."
             )
 
             return
@@ -846,11 +1374,14 @@ async def settings_input(
         settings["history_limit"] = value
 
         if value == 1:
+
             clear_all_history()
 
         elif value > 1:
 
-            for chat_id in list(histories):
+            for chat_id in list(
+                histories
+            ):
 
                 histories[chat_id] = deque(
                     histories[chat_id],
@@ -865,6 +1396,10 @@ async def settings_input(
         await update.message.reply_text(
             f"✅ Лимит памяти: {value}"
         )
+
+    # --------------------------------------------------------
+    # API KEYS
+    # --------------------------------------------------------
 
     elif waiting == "api_keys":
 
@@ -897,7 +1432,9 @@ async def settings_input(
 
         if name == "gemini":
 
-            settings["gemini_api_key"] = value
+            settings[
+                "gemini_api_key"
+            ] = value
 
             answer = (
                 "🤖 Gemini API ключ сохранён."
@@ -905,7 +1442,9 @@ async def settings_input(
 
         elif name == "pixazo":
 
-            settings["pixazo_api_key"] = value
+            settings[
+                "pixazo_api_key"
+            ] = value
 
             answer = (
                 "🖼 Pixazo API ключ сохранён."
@@ -916,7 +1455,8 @@ async def settings_input(
             settings["hf_token"] = value
 
             answer = (
-                "🎬 Hugging Face Token сохранён."
+                "🎬 Hugging Face Token "
+                "сохранён."
             )
 
         else:
@@ -973,7 +1513,7 @@ async def start_command(
 
         "🤖 Gemini — текст\n"
         "🖼 Pixazo — фото\n"
-        "🎬 LTX — видео\n"
+        "🎬 Wan2.2 — видео\n"
         "👁 Анализ фото\n"
         "🎧 Анализ аудио\n"
         "🎥 Анализ видео\n\n"
@@ -989,7 +1529,7 @@ async def start_command(
 
 
 # ============================================================
-# /image
+# /IMAGE
 # ============================================================
 
 async def image_command(
@@ -1036,7 +1576,7 @@ async def image_command(
 
 
 # ============================================================
-# /video
+# /VIDEO
 # ============================================================
 
 async def video_command(
@@ -1058,8 +1598,9 @@ async def video_command(
 
     status = await update.message.reply_text(
         "🎬 Генерирую видео...\n\n"
-        "⏳ Бесплатный GPU может поставить "
-        "запрос в очередь."
+        "⏳ Бесплатный ZeroGPU "
+        "может поставить запрос "
+        "в очередь."
     )
 
     try:
@@ -1081,9 +1622,14 @@ async def video_command(
 
         try:
 
-            Path(video).unlink(
-                missing_ok=True
-            )
+            if isinstance(
+                video,
+                str
+            ):
+
+                Path(video).unlink(
+                    missing_ok=True
+                )
 
         except Exception:
             pass
@@ -1095,13 +1641,13 @@ async def video_command(
         )
 
         await status.edit_text(
-            "❌ Видео сейчас не удалось создать.\n\n"
+            "❌ Не удалось создать видео.\n\n"
             f"{e}"
         )
 
 
 # ============================================================
-# TEXT
+# TEXT MESSAGE
 # ============================================================
 
 IMAGE_WORDS = [
@@ -1116,6 +1662,7 @@ IMAGE_WORDS = [
     "сделай картинку",
     "сделай изображение",
 ]
+
 
 VIDEO_WORDS = [
     "сгенерируй видео",
@@ -1138,10 +1685,16 @@ async def text_message(
     if not text:
         return
 
-    # Settings input
+    # --------------------------------------------------------
+    # SETTINGS INPUT
+    # --------------------------------------------------------
+
     if (
-        update.effective_user.id == OWNER_ID
-        and context.user_data.get("waiting")
+        update.effective_user.id
+        == OWNER_ID
+        and context.user_data.get(
+            "waiting"
+        )
     ):
 
         await settings_input(
@@ -1151,7 +1704,10 @@ async def text_message(
 
         return
 
-    # Reply mode
+    # --------------------------------------------------------
+    # REPLY MODE
+    # --------------------------------------------------------
+
     if settings["reply_all"]:
 
         prompt = text.strip()
@@ -1168,9 +1724,9 @@ async def text_message(
 
     lower = prompt.lower()
 
-    # ========================================================
+    # --------------------------------------------------------
     # IMAGE
-    # ========================================================
+    # --------------------------------------------------------
 
     image_prefix = None
 
@@ -1220,9 +1776,9 @@ async def text_message(
 
         return
 
-    # ========================================================
+    # --------------------------------------------------------
     # VIDEO
-    # ========================================================
+    # --------------------------------------------------------
 
     video_prefix = None
 
@@ -1247,7 +1803,8 @@ async def text_message(
 
         status = await update.message.reply_text(
             "🎬 Генерирую видео...\n\n"
-            "⏳ Ищу свободный бесплатный GPU."
+            "⏳ Проверяю бесплатные "
+            "ZeroGPU Spaces."
         )
 
         try:
@@ -1269,9 +1826,14 @@ async def text_message(
 
             try:
 
-                Path(video).unlink(
-                    missing_ok=True
-                )
+                if isinstance(
+                    video,
+                    str
+                ):
+
+                    Path(video).unlink(
+                        missing_ok=True
+                    )
 
             except Exception:
                 pass
@@ -1283,15 +1845,15 @@ async def text_message(
             )
 
             await status.edit_text(
-                "❌ Не удалось получить бесплатный GPU.\n\n"
+                "❌ Видео не удалось создать.\n\n"
                 f"{e}"
             )
 
         return
 
-    # ========================================================
+    # --------------------------------------------------------
     # GEMINI
-    # ========================================================
+    # --------------------------------------------------------
 
     try:
 
@@ -1320,7 +1882,7 @@ async def text_message(
 
 
 # ============================================================
-# PHOTO
+# PHOTO ANALYSIS
 # ============================================================
 
 async def photo_message(
@@ -1569,7 +2131,7 @@ def main():
         .build()
     )
 
-    # Commands
+    # COMMANDS
 
     app.add_handler(
         CommandHandler(
@@ -1606,7 +2168,7 @@ def main():
         )
     )
 
-    # Settings
+    # SETTINGS
 
     app.add_handler(
         CallbackQueryHandler(
@@ -1614,7 +2176,7 @@ def main():
         )
     )
 
-    # Media
+    # MEDIA
 
     app.add_handler(
         MessageHandler(
@@ -1638,7 +2200,7 @@ def main():
         )
     )
 
-    # Text
+    # TEXT
 
     app.add_handler(
         MessageHandler(
