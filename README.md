@@ -1,40 +1,17 @@
-# Telegram AI Bot
+## Gemini integration and webhook
 
-Этот репозиторий — шаблон Telegram-бота с поддержкой Google Gemini (через ENV), генерации изображений и OCR (Tesseract).
+I implemented a generic Gemini adapter and added webhook support.
 
-Изменения в ветке gemini-integration:
-- Добавлено интерактивное меню /settings с inline-кнопками для изменения промпта, модели и параметров
-- Добавлены команды /on и /off для включения/выключения ответов бота в отдельном чате
-- Переключение api ключей per-chat отключено (API ключ должен быть добавлен в ENV: GEMINI_API_KEY)
+To use Gemini via a REST endpoint provide the following ENV vars:
+- GEMINI_API_KEY — bearer token for Gemini
+- GEMINI_API_ENDPOINT — full URL to the model prediction endpoint (e.g. https://us-central1-aiplatform.googleapis.com/v1/projects/...) if using PaLM/Vertex AI
+- GEMINI_MODEL_CHAT — model name for chat (optional)
+- GEMINI_MODEL_IMAGE — model name for images (optional)
 
-Быстрая инструкция:
+Webhook support:
+- Set USE_WEBHOOK=1, WEBHOOK_URL (public URL), and optionally WEBHOOK_PATH (default /webhook), PORT and HOST.
 
-1) В репозитории на Railway подключи переменные окружения:
-   - TELEGRAM_TOKEN — токен бота
-   - GEMINI_API_KEY — ключ доступа к Gemini (если используешь Gemini)
-   - DB_PATH — по желанию (по умолчанию data/bot.db)
-   - OCR_ENABLED — true/false
-   - IMAGE_PROVIDER — gemini
-   - IMAGE_DEFAULT_SIZE — 1024x1024
+Notes:
+- The Gemini adapter is intentionally generic: different Gemini/PaLM endpoints differ in request/response shape. Provide GEMINI_API_ENDPOINT that accepts the minimal payload used by the adapter ("model", "input", "temperature"). You can tweak ai_client._call_gemini to match the exact API response structure of your endpoint.
+- If GEMINI_* envs are not provided, the client will fall back to OpenAI if OPENAI_API_KEY is set.
 
-2) Деплой: Railway может использовать Dockerfile из репо. Также можно запускать локально:
-   python -m app.main
-
-Команды в боте:
-- /start — старт
-- /settings — открыть меню настроек (inline)
-- /setprompt <текст> — задать системный промпт для чата
-- /on — включить бота в этом чате
-- /off — выключить бота в этом чате
-- /image <описание> — сгенерировать изображение
-- Отправка фото — бот выполняет OCR и отвечает текстом (если OCR_ENABLED=true)
-
-Замечания:
-- API-ключи per-chat отключены по твоему запросу (1 = нет). Храните GEMINI_API_KEY в Railway Secrets/ENV.
-- Я сделал простое inline-меню для настроек; оно использует временное состояние (pending_actions) для ввода значений.
-- Бот использует GEMINI_API_KEY из ENV; реализации вызовов Gemini оставлены как интеграционный шаг (нужны креды и, возможно, дополнительная библиотека) — код ai_client.py использует провайдер, см. комментарии.
-
-Дальше могу:
-- Полностью интегрировать вызовы Google Gemini (требует метод/ключи) и тестирование
-- Добавить webhook поддержку
-- Добавить шифрование настроек (если захочешь per-chat ключи в будущем)
