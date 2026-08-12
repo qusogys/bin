@@ -1,18 +1,10 @@
-import asyncio
-import io
 import logging
 import os
-import random
-import tempfile
 from collections import defaultdict, deque
-from pathlib import Path
+from urllib.parse import quote
 
 import aiohttp
 import google.generativeai as genai
-
-from PIL import Image
-
-from gradio_client import Client, handle_file
 
 from telegram import (
     Update,
@@ -36,6 +28,7 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
+# Твой Telegram ID
 OWNER_ID = 8904429775
 
 
@@ -44,35 +37,87 @@ OWNER_ID = 8904429775
 # ============================================================
 
 settings = {
-    # TEXT
+
+    # ---------------- TEXT ----------------
+
     "gemini_model": "gemini-3.5-flash",
 
-    # IMAGE
-    "image_model": "flux-schnell",
-
-    # VIDEO
-    "video_space": "zerogpu-aoti/wan2-2-fp8da-aoti-faster",
-
-    # API
     "gemini_api_key": "",
-    "pixazo_api_key": "",
-    "hf_token": "",
 
-    # BOT
+
+    # ---------------- IMAGE ----------------
+
+    # Основная модель
+    "image_model": "seedream5",
+
+    "pollinations_api_key": "",
+
+
+    # ---------------- BOT ----------------
+
+    # False:
+    # бот отвечает только на сообщения с %
+    #
+    # True:
+    # бот отвечает на обычные сообщения тоже
+
     "reply_all": False,
 
-    # HISTORY
-    #
+
+    # ---------------- MEMORY ----------------
+
     # 0 = без лимита
-    # 1 = ничего не помнить
-    # N = последние N сообщений
+    # 1 = вообще не помнить
+    # 10 = последние 10
+    # 20 = последние 20
+
     "history_limit": 20,
 
-    # SYSTEM
+
+    # ---------------- SYSTEM PROMPT ----------------
+
     "system_prompt": (
         "Ты полезный AI-ассистент Telegram-бота. "
-        "Отвечай понятно, кратко и по делу."
+        "Отвечай понятно, грамотно и по делу."
     ),
+}
+
+
+# ============================================================
+# AVAILABLE IMAGE MODELS
+# ============================================================
+
+IMAGE_MODELS = {
+
+    "seedream5": "⭐ Seedream 5",
+
+    "nanobanana-2": "🍌 Nano Banana 2",
+
+    "nanobanana-pro": "🍌 Nano Banana Pro",
+
+    "ideogram-v4-quality":
+        "🎨 Ideogram V4 Quality",
+
+    "gpt-image-2":
+        "🧠 GPT Image 2",
+
+    "gptimage-large":
+        "🧠 GPT Image Large",
+
+    "flux":
+        "⚡ FLUX",
+
+    "grok-imagine-pro":
+        "🌌 Grok Imagine Pro",
+
+    "qwen-image":
+        "🔮 Qwen Image",
+
+    "wan-image-pro":
+        "🔥 Wan Image Pro",
+
+    "zimage":
+        "✨ Z-Image",
 }
 
 
@@ -83,14 +128,19 @@ settings = {
 histories = defaultdict(deque)
 
 
-def add_history(chat_id, role, text):
+def add_history(
+    chat_id,
+    role,
+    text,
+):
 
     limit = settings["history_limit"]
 
-    # 1 = ничего не сохраняем
+    # 1 = ничего не сохранять
     if limit == 1:
         return
 
+    # 0 = без ограничения
     if limit == 0:
 
         histories[chat_id].append({
@@ -99,6 +149,8 @@ def add_history(chat_id, role, text):
         })
 
         return
+
+    # Ограниченная память
 
     histories[chat_id] = deque(
         histories[chat_id],
@@ -121,14 +173,21 @@ def get_history(chat_id):
     if limit == 0:
         return list(histories[chat_id])
 
-    return list(histories[chat_id])[-limit:]
+    return list(
+        histories[chat_id]
+    )[-limit:]
 
 
 def clear_history(chat_id):
-    histories.pop(chat_id, None)
+
+    histories.pop(
+        chat_id,
+        None,
+    )
 
 
 def clear_all_history():
+
     histories.clear()
 
 
@@ -138,13 +197,15 @@ def clear_all_history():
 
 def configure_gemini():
 
-    key = settings["gemini_api_key"].strip()
+    key = settings[
+        "gemini_api_key"
+    ].strip()
 
     if not key:
 
         raise RuntimeError(
-            "Gemini API ключ не установлен.\n"
-            "Открой /settings → 🔑 API ключи."
+            "Gemini API ключ не установлен.\n\n"
+            "Открой /settings → 🔑 API ключи"
         )
 
     genai.configure(
@@ -152,7 +213,7 @@ def configure_gemini():
     )
 
 
-async def gemini_text(
+async def generate_text(
     chat_id,
     prompt,
 ):
@@ -160,15 +221,23 @@ async def gemini_text(
     configure_gemini()
 
     model = genai.GenerativeModel(
-        settings["gemini_model"],
+
+        settings[
+            "gemini_model"
+        ],
+
         system_instruction=(
-            settings["system_prompt"]
+            settings[
+                "system_prompt"
+            ]
         ),
     )
 
     contents = []
 
-    for item in get_history(chat_id):
+    for item in get_history(
+        chat_id
+    ):
 
         role = (
             "user"
@@ -194,8 +263,12 @@ async def gemini_text(
         ],
     })
 
-    response = await asyncio.to_thread(
+    response = await __import__(
+        "asyncio"
+    ).to_thread(
+
         model.generate_content,
+
         contents,
     )
 
@@ -217,89 +290,54 @@ async def gemini_text(
 
 
 # ============================================================
-# GEMINI MEDIA
+# POLLINATIONS IMAGE
 # ============================================================
 
-async def gemini_media(
-    chat_id,
+async def generate_image(
     prompt,
-    media_bytes,
-    mime_type,
 ):
 
-    configure_gemini()
-
-    model = genai.GenerativeModel(
-        settings["gemini_model"],
-        system_instruction=(
-            settings["system_prompt"]
-        ),
-    )
-
-    response = await asyncio.to_thread(
-        model.generate_content,
-        [
-            prompt,
-            {
-                "mime_type": mime_type,
-                "data": media_bytes,
-            },
-        ],
-    )
-
-    answer = response.text
-
-    add_history(
-        chat_id,
-        "user",
-        prompt,
-    )
-
-    add_history(
-        chat_id,
-        "assistant",
-        answer,
-    )
-
-    return answer
-
-
-# ============================================================
-# PIXAZO IMAGE
-# ============================================================
-
-PIXAZO_IMAGE_URL = (
-    "https://gateway.pixazo.ai/"
-    "flux-1-schnell/v1/getData"
-)
-
-
-async def generate_image(prompt):
-
-    key = settings[
-        "pixazo_api_key"
+    api_key = settings[
+        "pollinations_api_key"
     ].strip()
 
-    if not key:
+    if not api_key:
 
         raise RuntimeError(
-            "Pixazo API ключ не установлен."
+            "Pollinations API ключ "
+            "не установлен.\n\n"
+            "Открой /settings → "
+            "🔑 API ключи"
         )
+
+    model = settings[
+        "image_model"
+    ]
+
+    encoded_prompt = quote(
+        prompt,
+        safe="",
+    )
+
+    url = (
+        "https://gen.pollinations.ai/image/"
+        + encoded_prompt
+    )
+
+    params = {
+
+        "model": model,
+
+        "width": 1024,
+
+        "height": 1024,
+
+        "n": 1,
+    }
 
     headers = {
-        "Content-Type": "application/json",
-        "Ocp-Apim-Subscription-Key": key,
-    }
-
-    payload = {
-        "prompt": prompt,
-        "num_steps": 4,
-        "height": 1024,
-        "width": 1024,
-        "seed": random.randint(
-            1,
-            2_000_000_000,
-        ),
+        "Authorization":
+            f"Bearer {api_key}",
     }
 
     timeout = aiohttp.ClientTimeout(
@@ -310,628 +348,39 @@ async def generate_image(prompt):
         timeout=timeout
     ) as session:
 
-        async with session.post(
-            PIXAZO_IMAGE_URL,
+        async with session.get(
+            url,
+            params=params,
             headers=headers,
-            json=payload,
         ) as response:
 
-            text = await response.text()
-
             if response.status != 200:
 
-                raise RuntimeError(
-                    f"Pixazo HTTP "
-                    f"{response.status}\n{text}"
-                )
-
-            try:
-                data = await response.json()
-
-            except Exception:
+                text = await response.text()
 
                 raise RuntimeError(
-                    f"Pixazo вернул:\n{text}"
+                    f"Pollinations HTTP "
+                    f"{response.status}\n\n"
+                    f"{text[:2000]}"
                 )
 
-    image_url = (
-        data.get("output")
-        or data.get("image")
-        or data.get("url")
-        or data.get("output_url")
-    )
-
-    if not image_url:
-
-        raise RuntimeError(
-            "Pixazo не вернул URL картинки:\n"
-            + str(data)
-        )
-
-    return image_url
-
-
-# ============================================================
-# DOWNLOAD IMAGE
-# ============================================================
-
-async def download_file(
-    url,
-    output_path,
-):
-
-    timeout = aiohttp.ClientTimeout(
-        total=180
-    )
-
-    async with aiohttp.ClientSession(
-        timeout=timeout
-    ) as session:
-
-        async with session.get(url) as response:
-
-            if response.status != 200:
-
-                raise RuntimeError(
-                    f"Не удалось скачать файл: "
-                    f"HTTP {response.status}"
+            content_type = (
+                response.headers.get(
+                    "Content-Type",
+                    ""
                 )
+            )
 
             data = await response.read()
 
-    with open(
-        output_path,
-        "wb",
-    ) as f:
+    if not data:
 
-        f.write(data)
-
-
-# ============================================================
-# GRADIO
-# ============================================================
-
-def make_gradio_client():
-
-    space = settings[
-        "video_space"
-    ]
-
-    token = settings[
-        "hf_token"
-    ].strip()
-
-    if token:
-
-        try:
-
-            return Client(
-                space,
-                token=token,
-            )
-
-        except TypeError:
-
-            return Client(
-                space,
-                hf_token=token,
-            )
-
-    return Client(space)
-
-
-def get_api_info(client):
-
-    try:
-
-        return client.view_api(
-            all_endpoints=True,
-            return_format="dict",
+        raise RuntimeError(
+            "Pollinations вернул "
+            "пустой ответ."
         )
 
-    except TypeError:
-
-        return client.view_api(
-            all_endpoints=True,
-        )
-
-
-# ============================================================
-# FIND REAL VIDEO ENDPOINT
-# ============================================================
-
-def find_video_endpoint(
-    api_info,
-):
-
-    if not api_info:
-        return None, None
-
-    endpoints = {}
-
-    if isinstance(
-        api_info,
-        dict,
-    ):
-
-        named = api_info.get(
-            "named_endpoints"
-        )
-
-        if isinstance(
-            named,
-            dict,
-        ):
-
-            endpoints.update(named)
-
-        for key, value in api_info.items():
-
-            if isinstance(
-                value,
-                dict,
-            ):
-
-                if (
-                    "parameters" in value
-                    or "inputs" in value
-                ):
-
-                    endpoints[str(key)] = value
-
-    if not endpoints:
-
-        return None, None
-
-    # Сначала ищем именно generate_video
-    for name, data in endpoints.items():
-
-        clean = str(name).lower()
-
-        if (
-            "generate_video"
-            in clean
-        ):
-
-            return (
-                normalize_endpoint(name),
-                data,
-            )
-
-    # Потом любой endpoint с video
-    for name, data in endpoints.items():
-
-        text = (
-            str(name)
-            + " "
-            + str(data)
-        ).lower()
-
-        if "video" in text:
-
-            return (
-                normalize_endpoint(name),
-                data,
-            )
-
-    return None, None
-
-
-def normalize_endpoint(name):
-
-    name = str(name)
-
-    if not name.startswith("/"):
-        name = "/" + name
-
-    return name
-
-
-# ============================================================
-# PARAMETERS
-# ============================================================
-
-def get_parameters(
-    endpoint_data,
-):
-
-    if not isinstance(
-        endpoint_data,
-        dict,
-    ):
-
-        return []
-
-    return (
-        endpoint_data.get(
-            "parameters"
-        )
-        or endpoint_data.get(
-            "inputs"
-        )
-        or []
-    )
-
-
-def get_parameter_name(
-    parameter,
-    index,
-):
-
-    if isinstance(
-        parameter,
-        dict,
-    ):
-
-        return (
-            parameter.get(
-                "parameter_name"
-            )
-            or parameter.get(
-                "name"
-            )
-            or parameter.get(
-                "label"
-            )
-            or f"arg_{index}"
-        )
-
-    return f"arg_{index}"
-
-
-def get_default(
-    parameter,
-):
-
-    if not isinstance(
-        parameter,
-        dict,
-    ):
-
-        return None
-
-    return (
-        parameter.get(
-            "parameter_default"
-        )
-        if "parameter_default"
-        in parameter
-        else parameter.get(
-            "default"
-        )
-    )
-
-
-# ============================================================
-# BUILD WAN ARGUMENTS
-# ============================================================
-
-def build_wan_arguments(
-    endpoint_data,
-    prompt,
-    image_path,
-):
-
-    parameters = get_parameters(
-        endpoint_data
-    )
-
-    kwargs = {}
-
-    seed = random.randint(
-        0,
-        2_147_483_647,
-    )
-
-    for index, parameter in enumerate(
-        parameters
-    ):
-
-        name = get_parameter_name(
-            parameter,
-            index,
-        )
-
-        lname = name.lower()
-
-        # INPUT IMAGE
-        if (
-            "input_image"
-            in lname
-            or lname in {
-                "image",
-                "img",
-                "init_image",
-            }
-        ):
-
-            kwargs[name] = handle_file(
-                image_path
-            )
-
-        # PROMPT
-        elif (
-            "prompt" in lname
-            and "negative"
-            not in lname
-        ):
-
-            kwargs[name] = prompt
-
-        # NEGATIVE
-        elif (
-            "negative_prompt"
-            in lname
-        ):
-
-            kwargs[name] = (
-                "blurry, low quality, "
-                "distorted, deformed, "
-                "watermark"
-            )
-
-        # STEPS
-        elif (
-            "steps" in lname
-            or "inference_steps"
-            in lname
-        ):
-
-            kwargs[name] = 4
-
-        # DURATION
-        elif (
-            "duration"
-            in lname
-        ):
-
-            kwargs[name] = 3.5
-
-        # GUIDANCE
-        elif (
-            "guidance_scale"
-            in lname
-        ):
-
-            kwargs[name] = 1.0
-
-        # SECOND GUIDANCE
-        elif (
-            "guidance_scale_2"
-            in lname
-        ):
-
-            kwargs[name] = 1.0
-
-        # SEED
-        elif lname == "seed":
-
-            kwargs[name] = seed
-
-        # RANDOM SEED
-        elif (
-            "randomize_seed"
-            in lname
-        ):
-
-            kwargs[name] = True
-
-        # DEFAULT
-        else:
-
-            default = get_default(
-                parameter
-            )
-
-            if default is not None:
-
-                kwargs[name] = default
-
-    return kwargs
-
-
-# ============================================================
-# EXTRACT VIDEO
-# ============================================================
-
-def extract_video(result):
-
-    if result is None:
-        return None
-
-    if isinstance(
-        result,
-        str,
-    ):
-
-        if (
-            result.startswith(
-                "http://"
-            )
-            or result.startswith(
-                "https://"
-            )
-            or os.path.exists(result)
-            or result.lower().endswith(
-                (
-                    ".mp4",
-                    ".webm",
-                    ".mov",
-                )
-            )
-        ):
-
-            return result
-
-    if isinstance(
-        result,
-        dict,
-    ):
-
-        for key in (
-            "path",
-            "url",
-            "video",
-            "file",
-        ):
-
-            if result.get(key):
-
-                return result[key]
-
-        for value in result.values():
-
-            found = extract_video(
-                value
-            )
-
-            if found:
-                return found
-
-    if isinstance(
-        result,
-        (list, tuple),
-    ):
-
-        for value in result:
-
-            found = extract_video(
-                value
-            )
-
-            if found:
-                return found
-
-    return None
-
-
-# ============================================================
-# TEXT → IMAGE → VIDEO
-# ============================================================
-
-async def generate_video(
-    prompt,
-):
-
-    image_url = None
-    image_path = None
-
-    try:
-
-        # ----------------------------------------------------
-        # STEP 1 — PIXAZO IMAGE
-        # ----------------------------------------------------
-
-        image_url = await generate_image(
-            prompt
-        )
-
-        logging.info(
-            "Generated image: %s",
-            image_url
-        )
-
-        # ----------------------------------------------------
-        # STEP 2 — DOWNLOAD
-        # ----------------------------------------------------
-
-        fd, image_path = tempfile.mkstemp(
-            suffix=".png"
-        )
-
-        os.close(fd)
-
-        await download_file(
-            image_url,
-            image_path,
-        )
-
-        # Проверяем, что это действительно картинка
-        Image.open(
-            image_path
-        ).verify()
-
-        # ----------------------------------------------------
-        # STEP 3 — WAN
-        # ----------------------------------------------------
-
-        client = make_gradio_client()
-
-        api_info = get_api_info(
-            client
-        )
-
-        logging.info(
-            "Wan API: %s",
-            api_info
-        )
-
-        endpoint_name, endpoint_data = (
-            find_video_endpoint(
-                api_info
-            )
-        )
-
-        if not endpoint_name:
-
-            raise RuntimeError(
-                "Не найден endpoint "
-                "generate_video в Wan2.2."
-            )
-
-        logging.info(
-            "Using endpoint: %s",
-            endpoint_name
-        )
-
-        kwargs = build_wan_arguments(
-            endpoint_data,
-            prompt,
-            image_path,
-        )
-
-        logging.info(
-            "Wan arguments: %s",
-            list(kwargs.keys())
-        )
-
-        job = client.submit(
-            api_name=endpoint_name,
-            **kwargs,
-        )
-
-        result = job.result()
-
-        logging.info(
-            "Wan result: %r",
-            result,
-        )
-
-        video = extract_video(
-            result
-        )
-
-        if not video:
-
-            raise RuntimeError(
-                "Wan завершил генерацию, "
-                "но видео не найдено:\n"
-                + str(result)
-            )
-
-        return video
-
-    finally:
-
-        if image_path:
-
-            try:
-                os.remove(
-                    image_path
-                )
-
-            except Exception:
-                pass
+    return data, content_type
 
 
 # ============================================================
@@ -952,14 +401,7 @@ def settings_keyboard():
         [
             InlineKeyboardButton(
                 "🖼 Модель фото",
-                callback_data="image_model",
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🎬 Модель видео",
-                callback_data="video_model",
+                callback_data="image_models",
             ),
         ],
 
@@ -968,16 +410,18 @@ def settings_keyboard():
                 "🧠 Память",
                 callback_data="history",
             ),
+        ],
 
+        [
             InlineKeyboardButton(
-                "🗑 Очистить",
+                "🗑 Очистить память",
                 callback_data="clear_history",
             ),
         ],
 
         [
             InlineKeyboardButton(
-                "📝 Роль",
+                "📝 Системная роль",
                 callback_data="system_prompt",
             ),
         ],
@@ -991,16 +435,80 @@ def settings_keyboard():
 
         [
             InlineKeyboardButton(
-                "✅ Реагировать на всё",
-                callback_data="reply_on",
-            ),
-
-            InlineKeyboardButton(
-                "％ Только %",
-                callback_data="reply_off",
+                "💬 Ответ на всё",
+                callback_data="reply_mode",
             ),
         ],
     ])
+
+
+# ============================================================
+# IMAGE MODEL KEYBOARD
+# ============================================================
+
+def image_models_keyboard():
+
+    buttons = []
+
+    for model, name in IMAGE_MODELS.items():
+
+        selected = (
+            " ✅"
+            if model
+            == settings["image_model"]
+            else ""
+        )
+
+        buttons.append([
+            InlineKeyboardButton(
+                name + selected,
+                callback_data=(
+                    "set_image:"
+                    + model
+                ),
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "⬅️ Назад",
+            callback_data="settings",
+        )
+    ])
+
+    return InlineKeyboardMarkup(
+        buttons
+    )
+
+
+# ============================================================
+# /START
+# ============================================================
+
+async def start_command(
+    update,
+    context,
+):
+
+    await update.message.reply_text(
+
+        "🤖 AI BOT\n\n"
+
+        "📝 Gemini — текст\n"
+        "🖼 Pollinations — фото\n\n"
+
+        "Примеры:\n\n"
+
+        "%привет\n"
+        "%объясни квантовую физику\n"
+        "%сгенерируй фото "
+        "рыжего кота\n\n"
+
+        "Команды:\n"
+        "/settings\n"
+        "/image\n"
+        "/cancel"
+    )
 
 
 # ============================================================
@@ -1023,23 +531,25 @@ async def settings_command(
 
         return
 
+    model_name = IMAGE_MODELS.get(
+        settings["image_model"],
+        settings["image_model"],
+    )
+
     await update.message.reply_text(
 
-        "⚙️ Настройки\n\n"
+        "⚙️ НАСТРОЙКИ\n\n"
 
-        f"🤖 Текст: "
-        f"{settings['gemini_model']}\n"
+        f"🤖 Текст:\n"
+        f"{settings['gemini_model']}\n\n"
 
-        f"🖼 Фото: "
-        f"{settings['image_model']}\n"
+        f"🖼 Фото:\n"
+        f"{model_name}\n\n"
 
-        f"🎬 Видео: "
-        f"{settings['video_space']}\n\n"
+        f"🧠 Память:\n"
+        f"{settings['history_limit']}\n\n"
 
-        f"🧠 Память: "
-        f"{settings['history_limit']}\n"
-
-        f"💬 Ответ на всё: "
+        f"💬 Ответ на всё:\n"
         f"{'ДА' if settings['reply_all'] else 'НЕТ'}",
 
         reply_markup=settings_keyboard(),
@@ -1047,7 +557,7 @@ async def settings_command(
 
 
 # ============================================================
-# CALLBACK
+# CALLBACK SETTINGS
 # ============================================================
 
 async def settings_callback(
@@ -1072,7 +582,85 @@ async def settings_callback(
 
     data = query.data
 
-    # TEXT MODEL
+
+    # ---------------- SETTINGS ----------------
+
+    if data == "settings":
+
+        await query.edit_message_text(
+
+            "⚙️ НАСТРОЙКИ\n\n"
+
+            f"🤖 Текст: "
+            f"{settings['gemini_model']}\n"
+
+            f"🖼 Фото: "
+            f"{settings['image_model']}\n"
+
+            f"🧠 Память: "
+            f"{settings['history_limit']}",
+
+            reply_markup=settings_keyboard(),
+        )
+
+        return
+
+
+    # ---------------- IMAGE MODELS ----------------
+
+    if data == "image_models":
+
+        await query.edit_message_text(
+
+            "🖼 ВЫБОР МОДЕЛИ ФОТО\n\n"
+
+            "Выбери модель:",
+
+            reply_markup=(
+                image_models_keyboard()
+            ),
+        )
+
+        return
+
+
+    # ---------------- SET IMAGE MODEL ----------------
+
+    if data.startswith(
+        "set_image:"
+    ):
+
+        model = data.split(
+            ":",
+            1,
+        )[1]
+
+        if model not in IMAGE_MODELS:
+
+            await query.edit_message_text(
+                "❌ Неизвестная модель."
+            )
+
+            return
+
+        settings[
+            "image_model"
+        ] = model
+
+        await query.edit_message_text(
+
+            "✅ Модель фото изменена:\n\n"
+            + IMAGE_MODELS[model],
+
+            reply_markup=(
+                image_models_keyboard()
+            ),
+        )
+
+        return
+
+
+    # ---------------- TEXT MODEL ----------------
 
     if data == "text_model":
 
@@ -1081,50 +669,22 @@ async def settings_callback(
         ] = "text_model"
 
         await query.edit_message_text(
-            "🤖 Отправь модель текста.\n\n"
+
+            "🤖 Отправь название "
+            "модели Gemini.\n\n"
+
             "Например:\n"
             "gemini-3.5-flash\n\n"
+
             "/cancel"
         )
 
-    # IMAGE MODEL
+        return
 
-    elif data == "image_model":
 
-        context.user_data[
-            "waiting"
-        ] = "image_model"
+    # ---------------- HISTORY ----------------
 
-        await query.edit_message_text(
-            "🖼 Отправь название модели фото.\n\n"
-            "Например:\n"
-            "flux-schnell\n\n"
-            "/cancel"
-        )
-
-    # VIDEO MODEL
-
-    elif data == "video_model":
-
-        await query.edit_message_text(
-
-            "🎬 Видео\n\n"
-
-            "Сейчас используется:\n"
-            "Wan2.2 14B Fast\n\n"
-
-            "Схема:\n"
-            "текст → Pixazo → картинка "
-            "→ Wan2.2 → видео\n\n"
-
-            "Space:\n"
-            "zerogpu-aoti/"
-            "wan2-2-fp8da-aoti-faster"
-        )
-
-    # HISTORY
-
-    elif data == "history":
+    if data == "history":
 
         context.user_data[
             "waiting"
@@ -1132,7 +692,7 @@ async def settings_callback(
 
         await query.edit_message_text(
 
-            "🧠 Лимит памяти:\n\n"
+            "🧠 ПАМЯТЬ\n\n"
 
             "0 — без лимита\n"
             "1 — ничего не помнить\n"
@@ -1142,19 +702,25 @@ async def settings_callback(
             "Отправь число."
         )
 
-    # CLEAR
+        return
 
-    elif data == "clear_history":
+
+    # ---------------- CLEAR ----------------
+
+    if data == "clear_history":
 
         clear_all_history()
 
         await query.edit_message_text(
-            "🗑 История всех чатов очищена."
+            "🗑 Вся память очищена."
         )
 
-    # ROLE
+        return
 
-    elif data == "system_prompt":
+
+    # ---------------- SYSTEM PROMPT ----------------
+
+    if data == "system_prompt":
 
         context.user_data[
             "waiting"
@@ -1162,17 +728,22 @@ async def settings_callback(
 
         await query.edit_message_text(
 
-            "📝 Отправь новую роль.\n\n"
+            "📝 Отправь системную роль.\n\n"
 
-            "Например:\n"
-            "Ты эксперт по Python.\n\n"
+            "Например:\n\n"
+
+            "Ты эксперт по программированию. "
+            "Отвечай кратко и понятно.\n\n"
 
             "/cancel"
         )
 
-    # API
+        return
 
-    elif data == "api_keys":
+
+    # ---------------- API KEYS ----------------
+
+    if data == "api_keys":
 
         context.user_data[
             "waiting"
@@ -1180,41 +751,48 @@ async def settings_callback(
 
         await query.edit_message_text(
 
-            "🔑 API ключи\n\n"
+            "🔑 API КЛЮЧИ\n\n"
 
-            "Можно отправить по одному:\n\n"
+            "Отправляй по одному:\n\n"
 
             "gemini: ключ\n"
-            "pixazo: ключ\n"
-            "hf: hf_ключ\n\n"
+            "pollinations: ключ\n\n"
 
-            "Для видео HF Token "
-            "не обязателен.\n\n"
+            "Например:\n"
+            "pollinations: sk_xxxxx\n\n"
 
             "/cancel"
         )
 
-    # REPLY ON
+        return
 
-    elif data == "reply_on":
 
-        settings["reply_all"] = True
+    # ---------------- REPLY MODE ----------------
 
-        await query.edit_message_text(
-            "✅ Теперь бот отвечает "
-            "на все сообщения."
+    if data == "reply_mode":
+
+        settings[
+            "reply_all"
+        ] = not settings[
+            "reply_all"
+        ]
+
+        mode = (
+            "все сообщения"
+            if settings["reply_all"]
+            else "только сообщения с %"
         )
 
-    # REPLY OFF
-
-    elif data == "reply_off":
-
-        settings["reply_all"] = False
-
         await query.edit_message_text(
-            "✅ Теперь бот отвечает "
-            "только на сообщения с %."
+
+            "💬 Режим изменён.\n\n"
+            f"Теперь бот отвечает на: "
+            f"{mode}",
+
+            reply_markup=settings_keyboard(),
         )
+
+        return
 
 
 # ============================================================
@@ -1230,18 +808,19 @@ async def settings_input(
         update.effective_user.id
         != OWNER_ID
     ):
-        return
+        return False
 
     waiting = context.user_data.get(
         "waiting"
     )
 
     if not waiting:
-        return
+        return False
 
     text = update.message.text.strip()
 
-    # TEXT MODEL
+
+    # ---------------- TEXT MODEL ----------------
 
     if waiting == "text_model":
 
@@ -1255,31 +834,16 @@ async def settings_input(
         )
 
         await update.message.reply_text(
-            "✅ Модель текста:\n"
+            "✅ Модель текста изменена:\n"
             + text
         )
 
-    # IMAGE MODEL
+        return True
 
-    elif waiting == "image_model":
 
-        settings[
-            "image_model"
-        ] = text
+    # ---------------- HISTORY ----------------
 
-        context.user_data.pop(
-            "waiting",
-            None,
-        )
-
-        await update.message.reply_text(
-            "✅ Модель фото:\n"
-            + text
-        )
-
-    # HISTORY
-
-    elif waiting == "history":
+    if waiting == "history":
 
         try:
 
@@ -1291,10 +855,11 @@ async def settings_input(
         except ValueError:
 
             await update.message.reply_text(
-                "❌ Отправь целое число."
+                "❌ Нужно отправить "
+                "целое число."
             )
 
-            return
+            return True
 
         settings[
             "history_limit"
@@ -1306,7 +871,9 @@ async def settings_input(
 
         elif value > 1:
 
-            for chat_id in histories:
+            for chat_id in list(
+                histories.keys()
+            ):
 
                 histories[
                     chat_id
@@ -1321,12 +888,15 @@ async def settings_input(
         )
 
         await update.message.reply_text(
-            f"✅ Лимит памяти: {value}"
+            f"✅ Память: {value}"
         )
 
-    # ROLE
+        return True
 
-    elif waiting == "system_prompt":
+
+    # ---------------- SYSTEM PROMPT ----------------
+
+    if waiting == "system_prompt":
 
         settings[
             "system_prompt"
@@ -1338,23 +908,28 @@ async def settings_input(
         )
 
         await update.message.reply_text(
-            "✅ Роль изменена."
+            "✅ Системная роль изменена."
         )
 
-    # API
+        return True
 
-    elif waiting == "api_keys":
+
+    # ---------------- API KEYS ----------------
+
+    if waiting == "api_keys":
 
         if ":" not in text:
 
             await update.message.reply_text(
-                "❌ Формат:\n\n"
+
+                "❌ Неверный формат.\n\n"
+
+                "Используй:\n"
                 "gemini: ключ\n"
-                "pixazo: ключ\n"
-                "hf: ключ"
+                "pollinations: ключ"
             )
 
-            return
+            return True
 
         name, value = text.split(
             ":",
@@ -1364,6 +939,15 @@ async def settings_input(
         name = name.strip().lower()
         value = value.strip()
 
+        if not value:
+
+            await update.message.reply_text(
+                "❌ Ключ пустой."
+            )
+
+            return True
+
+
         if name == "gemini":
 
             settings[
@@ -1371,40 +955,32 @@ async def settings_input(
             ] = value
 
             answer = (
-                "🤖 Gemini ключ сохранён."
+                "🤖 Gemini API ключ сохранён."
             )
 
-        elif name == "pixazo":
+
+        elif name == "pollinations":
 
             settings[
-                "pixazo_api_key"
+                "pollinations_api_key"
             ] = value
 
             answer = (
-                "🖼 Pixazo ключ сохранён."
+                "🖼 Pollinations API "
+                "ключ сохранён."
             )
 
-        elif name == "hf":
-
-            settings[
-                "hf_token"
-            ] = value
-
-            answer = (
-                "🤗 Hugging Face Token "
-                "сохранён."
-            )
 
         else:
 
             await update.message.reply_text(
-                "❌ Используй:\n"
+                "❌ Доступны только:\n\n"
                 "gemini:\n"
-                "pixazo:\n"
-                "hf:"
+                "pollinations:"
             )
 
-            return
+            return True
+
 
         context.user_data.pop(
             "waiting",
@@ -1415,9 +991,14 @@ async def settings_input(
             "✅ " + answer
         )
 
+        return True
+
+
+    return False
+
 
 # ============================================================
-# CANCEL
+# /CANCEL
 # ============================================================
 
 async def cancel_command(
@@ -1436,35 +1017,7 @@ async def cancel_command(
 
 
 # ============================================================
-# START
-# ============================================================
-
-async def start_command(
-    update,
-    context,
-):
-
-    await update.message.reply_text(
-
-        "🤖 AI BOT\n\n"
-
-        "📝 Текст — Gemini\n"
-        "🖼 Фото — Pixazo\n"
-        "🎬 Видео — Pixazo + Wan2.2\n"
-        "🧠 Память чата\n\n"
-
-        "Примеры:\n\n"
-
-        "%привет\n"
-        "%сгенерируй фото кота\n"
-        "%сгенерируй видео кот идёт по улице\n\n"
-
-        "/settings"
-    )
-
-
-# ============================================================
-# IMAGE COMMAND
+# /IMAGE
 # ============================================================
 
 async def image_command(
@@ -1475,7 +1028,12 @@ async def image_command(
     if not context.args:
 
         await update.message.reply_text(
-            "/image кот в космосе"
+
+            "Использование:\n\n"
+
+            "/image "
+            "реалистичный рыжий кот "
+            "на диване"
         )
 
         return
@@ -1490,13 +1048,20 @@ async def image_command(
             ChatAction.UPLOAD_PHOTO
         )
 
-        url = await generate_image(
-            prompt
+        data, content_type = (
+            await generate_image(
+                prompt
+            )
         )
 
+        # Telegram принимает bytes
         await update.message.reply_photo(
-            photo=url,
-            caption="🖼 Готово!"
+            photo=data,
+            caption=(
+                "🖼 Готово!\n"
+                f"Модель: "
+                f"{settings['image_model']}"
+            ),
         )
 
     except Exception as e:
@@ -1506,88 +1071,14 @@ async def image_command(
         )
 
         await update.message.reply_text(
-            f"❌ Ошибка:\n{e}"
-        )
-
-
-# ============================================================
-# VIDEO COMMAND
-# ============================================================
-
-async def video_command(
-    update,
-    context,
-):
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "/video кот идёт по улице"
-        )
-
-        return
-
-    prompt = " ".join(
-        context.args
-    )
-
-    status = await update.message.reply_text(
-        "🎬 Генерирую видео...\n\n"
-        "1️⃣ Создаю стартовый кадр\n"
-        "2️⃣ Передаю его Wan2.2\n"
-        "3️⃣ Жду видео"
-    )
-
-    try:
-
-        video = await generate_video(
-            prompt
-        )
-
-        await status.delete()
-
-        await update.message.chat.send_action(
-            ChatAction.UPLOAD_VIDEO
-        )
-
-        await update.message.reply_video(
-            video=video,
-            caption="🎬 Готово!"
-        )
-
-    except Exception as e:
-
-        logging.exception(
-            "VIDEO ERROR"
-        )
-
-        await status.edit_text(
-            "❌ Ошибка видео:\n\n"
+            "❌ Ошибка генерации фото:\n\n"
             + str(e)
         )
 
 
 # ============================================================
-# TEXT
+# TEXT MESSAGE
 # ============================================================
-
-IMAGE_WORDS = [
-    "сгенерируй фото",
-    "сгенерируй картинку",
-    "сгенерируй изображение",
-    "создай фото",
-    "создай картинку",
-    "создай изображение",
-    "сделай фото",
-    "сделай картинку",
-]
-
-VIDEO_WORDS = [
-    "сгенерируй видео",
-    "создай видео",
-    "сделай видео",
-]
-
 
 async def text_message(
     update,
@@ -1596,20 +1087,23 @@ async def text_message(
 
     text = update.message.text
 
+    # Сначала проверяем ввод настроек
+
     if (
         update.effective_user.id
         == OWNER_ID
-        and context.user_data.get(
-            "waiting"
-        )
     ):
 
-        await settings_input(
+        handled = await settings_input(
             update,
             context,
         )
 
-        return
+        if handled:
+            return
+
+
+    # ---------------- MODE ----------------
 
     if settings["reply_all"]:
 
@@ -1620,93 +1114,113 @@ async def text_message(
         if not text.startswith("%"):
             return
 
-        prompt = text[1:].strip()
+        prompt = text[
+            1:
+        ].strip()
+
+
+    if not prompt:
+        return
+
 
     lower = prompt.lower()
 
+
+    # ========================================================
     # IMAGE
+    # ========================================================
 
-    for word in IMAGE_WORDS:
+    image_triggers = [
 
-        if lower.startswith(word):
+        "сгенерируй фото",
 
-            image_prompt = prompt[
-                len(word):
-            ].strip()
+        "сгенерируй картинку",
 
-            if not image_prompt:
-                image_prompt = (
-                    "реалистичная фотография"
-                )
+        "сгенерируй изображение",
 
-            try:
+        "создай фото",
 
-                await update.message.chat.send_action(
-                    ChatAction.UPLOAD_PHOTO
-                )
+        "создай картинку",
 
-                url = await generate_image(
+        "создай изображение",
+
+        "сделай фото",
+
+        "сделай картинку",
+
+        "нарисуй",
+    ]
+
+
+    image_trigger = None
+
+    for trigger in image_triggers:
+
+        if lower.startswith(
+            trigger
+        ):
+
+            image_trigger = trigger
+
+            break
+
+
+    if image_trigger:
+
+        image_prompt = prompt[
+            len(image_trigger):
+        ].strip()
+
+
+        if not image_prompt:
+
+            image_prompt = (
+                "красивая реалистичная "
+                "фотография"
+            )
+
+
+        try:
+
+            await update.message.chat.send_action(
+                ChatAction.UPLOAD_PHOTO
+            )
+
+            data, content_type = (
+                await generate_image(
                     image_prompt
-                )
-
-                await update.message.reply_photo(
-                    photo=url,
-                    caption="🖼 Готово!"
-                )
-
-            except Exception as e:
-
-                await update.message.reply_text(
-                    "❌ Ошибка фото:\n"
-                    + str(e)
-                )
-
-            return
-
-    # VIDEO
-
-    for word in VIDEO_WORDS:
-
-        if lower.startswith(word):
-
-            video_prompt = prompt[
-                len(word):
-            ].strip()
-
-            if not video_prompt:
-                video_prompt = (
-                    "кинематографичный пейзаж"
-                )
-
-            status = (
-                await update.message.reply_text(
-                    "🎬 Генерирую видео..."
                 )
             )
 
-            try:
+            await update.message.reply_photo(
 
-                video = await generate_video(
-                    video_prompt
-                )
+                photo=data,
 
-                await status.delete()
+                caption=(
+                    "🖼 Готово!\n"
+                    f"Модель: "
+                    f"{settings['image_model']}"
+                ),
+            )
 
-                await update.message.reply_video(
-                    video=video,
-                    caption="🎬 Готово!"
-                )
+        except Exception as e:
 
-            except Exception as e:
+            logging.exception(
+                "IMAGE ERROR"
+            )
 
-                await status.edit_text(
-                    "❌ Ошибка видео:\n"
-                    + str(e)
-                )
+            await update.message.reply_text(
 
-            return
+                "❌ Ошибка генерации фото:\n\n"
+                + str(e)
+            )
 
+        return
+
+
+    # ========================================================
     # TEXT
+    # ========================================================
 
     try:
 
@@ -1714,8 +1228,10 @@ async def text_message(
             ChatAction.TYPING
         )
 
-        answer = await gemini_text(
+        answer = await generate_text(
+
             update.effective_chat.id,
+
             prompt,
         )
 
@@ -1725,8 +1241,13 @@ async def text_message(
 
     except Exception as e:
 
+        logging.exception(
+            "TEXT ERROR"
+        )
+
         await update.message.reply_text(
-            "❌ Ошибка Gemini:\n"
+
+            "❌ Ошибка Gemini:\n\n"
             + str(e)
         )
 
@@ -1752,43 +1273,69 @@ async def photo_message(
 
     if caption.startswith("%"):
 
-        caption = caption[1:].strip()
+        caption = caption[
+            1:
+        ].strip()
 
     if not caption:
 
         caption = (
-            "Подробно опиши изображение."
+            "Опиши подробно "
+            "что изображено на фото."
         )
 
     try:
 
-        photo = update.message.photo[-1]
+        photo = (
+            update.message.photo[-1]
+        )
 
         file = await context.bot.get_file(
             photo.file_id
         )
 
-        buffer = io.BytesIO()
-
-        await file.download_to_memory(
-            out=buffer
+        image_bytes = (
+            await file.download_as_bytearray()
         )
 
-        answer = await gemini_media(
-            update.effective_chat.id,
-            caption,
-            buffer.getvalue(),
-            "image/jpeg",
+        configure_gemini()
+
+        model = genai.GenerativeModel(
+            settings["gemini_model"]
+        )
+
+        response = await __import__(
+            "asyncio"
+        ).to_thread(
+
+            model.generate_content,
+
+            [
+                caption,
+
+                {
+                    "mime_type":
+                        "image/jpeg",
+
+                    "data":
+                        bytes(image_bytes),
+                },
+            ],
         )
 
         await update.message.reply_text(
-            answer
+            response.text
         )
 
     except Exception as e:
 
+        logging.exception(
+            "VISION ERROR"
+        )
+
         await update.message.reply_text(
-            "❌ Ошибка анализа:\n"
+
+            "❌ Ошибка анализа фото:\n\n"
             + str(e)
         )
 
@@ -1817,11 +1364,14 @@ def main():
     if not BOT_TOKEN:
 
         raise RuntimeError(
-            "Не установлен BOT_TOKEN."
+            "Установи BOT_TOKEN."
         )
 
+
     logging.basicConfig(
+
         level=logging.INFO,
+
         format=(
             "%(asctime)s "
             "%(levelname)s "
@@ -1829,78 +1379,94 @@ def main():
         ),
     )
 
-    app = (
+
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    app.add_handler(
+
+    # Commands
+
+    application.add_handler(
         CommandHandler(
             "start",
             start_command,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "settings",
             settings_command,
         )
     )
 
-    app.add_handler(
-        CommandHandler(
-            "cancel",
-            cancel_command,
-        )
-    )
-
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
             "image",
             image_command,
         )
     )
 
-    app.add_handler(
+    application.add_handler(
         CommandHandler(
-            "video",
-            video_command,
+            "cancel",
+            cancel_command,
         )
     )
 
-    app.add_handler(
+
+    # Settings
+
+    application.add_handler(
         CallbackQueryHandler(
             settings_callback
         )
     )
 
-    app.add_handler(
+
+    # Photo analysis
+
+    application.add_handler(
         MessageHandler(
             filters.PHOTO,
             photo_message,
         )
     )
 
-    app.add_handler(
+
+    # Text
+
+    application.add_handler(
         MessageHandler(
+
             filters.TEXT
             & ~filters.COMMAND,
+
             text_message,
         )
     )
 
-    app.add_error_handler(
+
+    application.add_error_handler(
         error_handler
     )
 
-    print("🤖 Bot started")
 
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES
+    print(
+        "🤖 AI BOT запущен"
+    )
+
+
+    application.run_polling(
+        allowed_updates=(
+            Update.ALL_TYPES
+        )
     )
 
 
 if __name__ == "__main__":
+
     main()
