@@ -13,6 +13,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    FSInputFile,
 )
 
 from google import genai
@@ -32,6 +33,8 @@ DEFAULT_MODEL = os.getenv(
     "gemini-3.5-flash-lite"
 )
 
+IMAGE_MODEL = "gemini-3.1-flash-image"
+
 DEFAULT_API_KEY = os.getenv(
     "GEMINI_API_KEY",
     ""
@@ -49,8 +52,6 @@ DEFAULT_ENABLED = (
     in ("true", "1", "yes", "on")
 )
 
-# 0 = без ограничения
-# 1 = не помнить предыдущие сообщения
 DEFAULT_HISTORY_LIMIT = int(
     os.getenv("HISTORY_LIMIT", "10")
 )
@@ -77,23 +78,6 @@ settings = {
 # ============================================================
 # CHAT HISTORY
 # ============================================================
-
-# История хранится отдельно для каждого Telegram chat_id.
-#
-# Например:
-#
-# chat_histories = {
-#     123456: [
-#         {"role": "user", "text": "Привет"},
-#         {"role": "model", "text": "Привет!"},
-#     ],
-#
-#     987654: [
-#         ...
-#     ]
-# }
-#
-# После перезапуска Railway история очистится.
 
 chat_histories: dict[int, list[dict[str, str]]] = {}
 
@@ -202,42 +186,42 @@ def settings_keyboard():
                     callback_data="settings_api",
                 )
             ],
-
             [
                 InlineKeyboardButton(
                     text="🎭 Роль / промт",
                     callback_data="settings_prompt",
                 )
             ],
-
             [
                 InlineKeyboardButton(
                     text=f"🤖 Модель: {settings['model']}",
                     callback_data="settings_model",
                 )
             ],
-
             [
                 InlineKeyboardButton(
                     text=f"{mode} — режим ответа",
                     callback_data="settings_toggle",
                 )
             ],
-
             [
                 InlineKeyboardButton(
                     text=f"🧠 История: {history_text}",
                     callback_data="settings_history",
                 )
             ],
-
             [
                 InlineKeyboardButton(
                     text="🗑 Очистить историю",
                     callback_data="settings_clear_history",
                 )
             ],
-
+            [
+                InlineKeyboardButton(
+                    text="🖼 Генерация фото: ВКЛ",
+                    callback_data="image_info",
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text="🔄 Обновить",
@@ -293,35 +277,27 @@ def settings_text():
         else "❌ не установлен"
     )
 
-    mode = (
-        "🟢 <b>ВКЛ</b>\n"
-        "Бот реагирует на все сообщения."
-        if settings["enabled"]
-        else
-        "🔴 <b>ВЫКЛ</b>\n"
-        "Бот реагирует только на сообщения, "
-        "начинающиеся с <code>%</code>."
-    )
+    if settings["enabled"]:
+        mode = (
+            "🟢 <b>ВКЛ</b>\n"
+            "Бот реагирует на все сообщения."
+        )
+    else:
+        mode = (
+            "🔴 <b>ВЫКЛ</b>\n"
+            "Бот реагирует только на сообщения "
+            "с <code>%</code>."
+        )
 
     history_limit = settings["history_limit"]
 
     if history_limit == 0:
-
-        history_text = (
-            "♾ <b>Без лимита</b>"
-        )
-
+        history_text = "♾ <b>Без лимита</b>"
     elif history_limit == 1:
-
-        history_text = (
-            "1 — <b>без памяти</b>"
-        )
-
+        history_text = "1 — <b>без памяти</b>"
     else:
-
         history_text = (
-            f"<b>{history_limit}</b> "
-            "сообщений"
+            f"<b>{history_limit}</b> сообщений"
         )
 
     prompt = settings["prompt"]
@@ -336,14 +312,17 @@ def settings_text():
 
         f"🔑 API key: {api_status}\n"
 
-        f"🤖 Модель: "
-        f"<code>{settings['model']}</code>\n\n"
+        f"🤖 Модель: <code>{settings['model']}</code>\n\n"
 
         f"📡 Режим:\n{mode}\n\n"
 
-        f"🧠 <b>История:</b> {history_text}\n\n"
+        f"🧠 История: {history_text}\n\n"
 
-        "🎭 <b>Роль / system prompt:</b>\n"
+        "🖼 <b>Генерация изображений:</b> "
+        "доступна\n"
+        f"🎨 Image model: <code>{IMAGE_MODEL}</code>\n\n"
+
+        "🎭 <b>Роль:</b>\n"
         f"<blockquote>{prompt}</blockquote>\n\n"
 
         "🌍 Настройки общие для всех чатов."
@@ -360,16 +339,19 @@ async def start_command(message: Message):
     await message.answer(
         "👋 <b>Gemini Telegram Bot</b>\n\n"
 
-        "Я умею работать с:\n"
-        "💬 текстом\n"
-        "📷 фотографиями\n"
-        "🎤 голосовыми\n"
-        "🎵 аудио\n"
-        "🎥 видео\n"
-        "📄 файлами\n\n"
+        "Я умею:\n"
+        "💬 отвечать на текст\n"
+        "📷 анализировать фотографии\n"
+        "🎤 анализировать аудио\n"
+        "🎥 анализировать видео\n"
+        "🖼 генерировать изображения\n"
+        "🧠 помнить историю чата\n\n"
 
-        "Для владельца доступна команда "
-        "/settings.",
+        "Генерация изображения:\n"
+        "<code>%нарисуй кота в космосе</code>\n\n"
+
+        "Для владельца:\n"
+        "<code>/settings</code>",
 
         parse_mode="HTML",
     )
@@ -447,10 +429,7 @@ async def settings_api(
 
     await callback.message.answer(
         "🔑 <b>Отправь Gemini API key.</b>\n\n"
-
-        "Этот ключ будет использоваться "
-        "во всех чатах.\n\n"
-
+        "Ключ используется во всех чатах.\n\n"
         "Для отмены:\n"
         "/cancel",
 
@@ -502,9 +481,7 @@ async def save_api_key(
         await asyncio.to_thread(
             lambda: list(
                 client.models.list(
-                    config={
-                        "page_size": 1
-                    }
+                    config={"page_size": 1}
                 )
             )
         )
@@ -524,8 +501,7 @@ async def save_api_key(
     await state.clear()
 
     await message.answer(
-        "✅ Gemini API key установлен.\n\n"
-        "Теперь он используется во всех чатах.",
+        "✅ Gemini API key установлен.",
         reply_markup=settings_keyboard(),
     )
 
@@ -554,16 +530,14 @@ async def settings_prompt(
     )
 
     await callback.message.answer(
-        "🎭 <b>Настройка роли</b>\n\n"
+        "🎭 <b>Новая роль / system prompt</b>\n\n"
 
-        "Отправь новый system prompt.\n\n"
+        "Отправь текст роли.\n\n"
 
-        "Например:\n\n"
-
+        "Например:\n"
         "<code>"
         "Ты профессиональный программист Python. "
-        "Отвечай подробно, показывай рабочий код "
-        "и объясняй ошибки."
+        "Отвечай понятно и подробно."
         "</code>\n\n"
 
         "Для отмены:\n"
@@ -609,7 +583,7 @@ async def save_prompt(
     await state.clear()
 
     await message.answer(
-        "✅ Роль успешно изменена.",
+        "✅ Роль изменена.",
         reply_markup=settings_keyboard(),
     )
 
@@ -637,20 +611,17 @@ async def settings_history(
         SettingsState.waiting_history_limit
     )
 
-    current = settings["history_limit"]
-
     await callback.message.answer(
         "🧠 <b>Лимит истории</b>\n\n"
 
-        "Отправь число.\n\n"
+        "Отправь число:\n\n"
 
-        "Примеры:\n"
-        "• <code>0</code> — без лимита\n"
-        "• <code>1</code> — ничего не помнить\n"
-        "• <code>5</code> — помнить последние сообщения\n"
-        "• <code>20</code> — помнить больше контекста\n\n"
+        "0 — без лимита\n"
+        "1 — ничего не помнить\n"
+        "5 — ограниченная память\n"
+        "20 — большая память\n\n"
 
-        f"Текущее значение: <b>{current}</b>\n\n"
+        f"Сейчас: <b>{settings['history_limit']}</b>\n\n"
 
         "Для отмены:\n"
         "/cancel",
@@ -672,26 +643,16 @@ async def save_history_limit(
         await state.clear()
         return
 
-    if not message.text:
-
-        await message.answer(
-            "❌ Отправь число."
-        )
-
-        return
-
     try:
 
         limit = int(
             message.text.strip()
         )
 
-    except ValueError:
+    except (ValueError, AttributeError):
 
         await message.answer(
-            "❌ Нужно отправить целое число.\n\n"
-            "Например: <code>10</code>",
-            parse_mode="HTML",
+            "❌ Отправь целое число."
         )
 
         return
@@ -699,7 +660,7 @@ async def save_history_limit(
     if limit < 0:
 
         await message.answer(
-            "❌ Число не может быть меньше 0."
+            "❌ Минимальное значение — 0."
         )
 
         return
@@ -709,8 +670,7 @@ async def save_history_limit(
     await state.clear()
 
     await message.answer(
-        f"✅ Лимит истории установлен: <b>{limit}</b>\n\n"
-        "Изменение применяется ко всем чатам.",
+        f"✅ Лимит истории: <b>{limit}</b>",
         reply_markup=settings_keyboard(),
         parse_mode="HTML",
     )
@@ -736,15 +696,38 @@ async def settings_clear_history(
 
         return
 
-    # Очищаем историю того чата,
-    # где владелец нажал кнопку.
-
     clear_chat_history(
         callback.message.chat.id
     )
 
     await callback.answer(
-        "🗑 История этого чата очищена."
+        "🗑 История этого чата очищена.",
+        show_alert=True,
+    )
+
+
+# ============================================================
+# IMAGE INFO
+# ============================================================
+
+@dp.callback_query(F.data == "image_info")
+async def image_info(
+    callback: CallbackQuery,
+):
+
+    if not is_owner(callback.from_user.id):
+
+        await callback.answer(
+            "⛔ Нет доступа.",
+            show_alert=True,
+        )
+
+        return
+
+    await callback.answer(
+        "🖼 Генерация включена. "
+        "Используй %нарисуй ...",
+        show_alert=True,
     )
 
 
@@ -752,9 +735,7 @@ async def settings_clear_history(
 # MODEL
 # ============================================================
 
-@dp.callback_query(
-    F.data == "settings_model"
-)
+@dp.callback_query(F.data == "settings_model")
 async def settings_model(
     callback: CallbackQuery,
 ):
@@ -769,19 +750,15 @@ async def settings_model(
         return
 
     await callback.message.edit_text(
-        "🤖 <b>Выбери модель:</b>",
-
+        "🤖 <b>Выбери модель для обычных ответов:</b>",
         reply_markup=model_keyboard(),
-
         parse_mode="HTML",
     )
 
     await callback.answer()
 
 
-@dp.callback_query(
-    F.data.startswith("model:")
-)
+@dp.callback_query(F.data.startswith("model:"))
 async def select_model(
     callback: CallbackQuery,
 ):
@@ -813,9 +790,7 @@ async def select_model(
 
     await callback.message.edit_text(
         settings_text(),
-
         reply_markup=settings_keyboard(),
-
         parse_mode="HTML",
     )
 
@@ -828,9 +803,7 @@ async def select_model(
 # TOGGLE
 # ============================================================
 
-@dp.callback_query(
-    F.data == "settings_toggle"
-)
+@dp.callback_query(F.data == "settings_toggle")
 async def settings_toggle(
     callback: CallbackQuery,
 ):
@@ -850,9 +823,7 @@ async def settings_toggle(
 
     await callback.message.edit_text(
         settings_text(),
-
         reply_markup=settings_keyboard(),
-
         parse_mode="HTML",
     )
 
@@ -865,9 +836,7 @@ async def settings_toggle(
 # REFRESH
 # ============================================================
 
-@dp.callback_query(
-    F.data == "settings_refresh"
-)
+@dp.callback_query(F.data == "settings_refresh")
 async def settings_refresh(
     callback: CallbackQuery,
 ):
@@ -883,9 +852,7 @@ async def settings_refresh(
 
     await callback.message.edit_text(
         settings_text(),
-
         reply_markup=settings_keyboard(),
-
         parse_mode="HTML",
     )
 
@@ -896,9 +863,7 @@ async def settings_refresh(
 # BACK
 # ============================================================
 
-@dp.callback_query(
-    F.data == "settings_back"
-)
+@dp.callback_query(F.data == "settings_back")
 async def settings_back(
     callback: CallbackQuery,
 ):
@@ -914,9 +879,7 @@ async def settings_back(
 
     await callback.message.edit_text(
         settings_text(),
-
         reply_markup=settings_keyboard(),
-
         parse_mode="HTML",
     )
 
@@ -924,7 +887,7 @@ async def settings_back(
 
 
 # ============================================================
-# DOWNLOAD MEDIA
+# MEDIA DOWNLOAD
 # ============================================================
 
 async def download_media(message: Message):
@@ -950,11 +913,7 @@ async def download_media(message: Message):
             destination=path,
         )
 
-        return (
-            temp_dir,
-            path,
-            "image/jpeg",
-        )
+        return temp_dir, path, "image/jpeg"
 
     # VOICE
 
@@ -971,11 +930,7 @@ async def download_media(message: Message):
             destination=path,
         )
 
-        return (
-            temp_dir,
-            path,
-            "audio/ogg",
-        )
+        return temp_dir, path, "audio/ogg"
 
     # AUDIO
 
@@ -1041,11 +996,7 @@ async def download_media(message: Message):
             destination=path,
         )
 
-        return (
-            temp_dir,
-            path,
-            "video/mp4",
-        )
+        return temp_dir, path, "video/mp4"
 
     # DOCUMENT
 
@@ -1074,29 +1025,17 @@ async def download_media(message: Message):
             or "application/octet-stream",
         )
 
-    return (
-        None,
-        None,
-        None,
-    )
+    return None, None, None
 
 
 # ============================================================
-# BUILD GEMINI CONTENT
+# HISTORY FOR GEMINI
 # ============================================================
 
 def build_history_contents(
     chat_id: int,
     current_prompt: str,
 ):
-    """
-    Формируем контекст для Gemini.
-
-    history_limit:
-        0 = вся история
-        1 = только текущий запрос
-        N = текущий запрос + N-1 предыдущих сообщений
-    """
 
     contents = []
 
@@ -1105,8 +1044,6 @@ def build_history_contents(
     history = get_chat_history(chat_id)
 
     if limit == 1:
-
-        # Полностью без памяти.
 
         contents.append(
             types.Content(
@@ -1121,32 +1058,23 @@ def build_history_contents(
 
         return contents
 
-    # --------------------------------------------------------
-    # Выбираем историю
-    # --------------------------------------------------------
-
     if limit == 0:
 
         selected_history = history
 
     else:
 
-        # Например limit=5:
-        # берём максимум 4 старых сообщения
-        # + текущий запрос.
-
         old_messages_count = max(
             limit - 1,
             0,
         )
 
-        selected_history = history[
-            -old_messages_count:
-        ] if old_messages_count > 0 else []
-
-    # --------------------------------------------------------
-    # Старые сообщения
-    # --------------------------------------------------------
+        if old_messages_count:
+            selected_history = history[
+                -old_messages_count:
+            ]
+        else:
+            selected_history = []
 
     for item in selected_history:
 
@@ -1160,10 +1088,6 @@ def build_history_contents(
                 ],
             )
         )
-
-    # --------------------------------------------------------
-    # Текущий запрос
-    # --------------------------------------------------------
 
     contents.append(
         types.Content(
@@ -1180,7 +1104,7 @@ def build_history_contents(
 
 
 # ============================================================
-# GEMINI
+# NORMAL GEMINI
 # ============================================================
 
 async def ask_gemini(
@@ -1194,26 +1118,17 @@ async def ask_gemini(
 
         raise RuntimeError(
             "Gemini API key не установлен.\n\n"
-            "Владелец должен открыть /settings "
-            "и установить API key."
+            "Открой /settings → 🔑 API key."
         )
 
     client = genai.Client(
         api_key=settings["api_key"]
     )
 
-    # --------------------------------------------------------
-    # История
-    # --------------------------------------------------------
-
     contents = build_history_contents(
         chat_id,
         prompt,
     )
-
-    # --------------------------------------------------------
-    # MEDIA
-    # --------------------------------------------------------
 
     if media_path:
 
@@ -1224,9 +1139,6 @@ async def ask_gemini(
             data = await asyncio.to_thread(
                 media_path.read_bytes
             )
-
-            # Добавляем файл к последнему
-            # сообщению пользователя.
 
             contents[-1].parts.append(
                 types.Part.from_bytes(
@@ -1250,17 +1162,10 @@ async def ask_gemini(
                 uploaded_file
             )
 
-    # --------------------------------------------------------
-    # Gemini
-    # --------------------------------------------------------
-
     response = await asyncio.to_thread(
         client.models.generate_content,
-
         model=settings["model"],
-
         contents=contents,
-
         config=types.GenerateContentConfig(
             system_instruction=settings["prompt"]
         ),
@@ -1272,19 +1177,144 @@ async def ask_gemini(
 
 
 # ============================================================
+# IMAGE GENERATION
+# ============================================================
+
+def is_image_request(text: str) -> bool:
+
+    text = text.lower().strip()
+
+    image_words = [
+        "нарисуй",
+        "сгенерируй фото",
+        "сгенерируй картинку",
+        "сгенерируй изображение",
+        "создай фото",
+        "создай картинку",
+        "создай изображение",
+        "сделай фото",
+        "сделай картинку",
+        "сделай изображение",
+        "изобрази",
+        "покажи картинкой",
+        "generate image",
+        "generate a picture",
+        "create image",
+        "create a picture",
+        "draw",
+    ]
+
+    return any(
+        text.startswith(word)
+        for word in image_words
+    )
+
+
+def clean_image_prompt(text: str) -> str:
+
+    prefixes = [
+        "нарисуй",
+        "сгенерируй фото",
+        "сгенерируй картинку",
+        "сгенерируй изображение",
+        "создай фото",
+        "создай картинку",
+        "создай изображение",
+        "сделай фото",
+        "сделай картинку",
+        "сделай изображение",
+        "изобрази",
+        "покажи картинкой",
+        "generate image",
+        "generate a picture",
+        "create image",
+        "create a picture",
+        "draw",
+    ]
+
+    result = text.strip()
+
+    lower = result.lower()
+
+    for prefix in prefixes:
+
+        if lower.startswith(prefix):
+
+            result = result[
+                len(prefix):
+            ].strip()
+
+            break
+
+    return result
+
+
+async def generate_image(
+    prompt: str,
+):
+
+    if not settings["api_key"]:
+
+        raise RuntimeError(
+            "Gemini API key не установлен.\n\n"
+            "Открой /settings → 🔑 API key."
+        )
+
+    client = genai.Client(
+        api_key=settings["api_key"]
+    )
+
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+
+        model=IMAGE_MODEL,
+
+        contents=prompt,
+
+        config=types.GenerateContentConfig(
+            response_modalities=["IMAGE"],
+            response_format={
+                "image": {
+                    "aspect_ratio": "1:1",
+                    "image_size": "1K",
+                }
+            },
+        ),
+    )
+
+    for part in response.parts:
+
+        if part.inline_data is not None:
+
+            image = part.as_image()
+
+            temp_dir = Path(
+                tempfile.mkdtemp(
+                    prefix="gemini_image_"
+                )
+            )
+
+            image_path = (
+                temp_dir / "generated.png"
+            )
+
+            image.save(image_path)
+
+            return temp_dir, image_path
+
+    raise RuntimeError(
+        "Gemini не вернул изображение."
+    )
+
+
+# ============================================================
 # SHOULD ANSWER
 # ============================================================
 
 def should_answer(message: Message):
 
-    # ВКЛ:
-    # отвечаем на все сообщения.
-
     if settings["enabled"]:
         return True
-
-    # ВЫКЛ:
-    # только сообщения, начинающиеся с %.
 
     text = (
         message.text
@@ -1296,7 +1326,7 @@ def should_answer(message: Message):
 
 
 # ============================================================
-# GET USER PROMPT
+# USER PROMPT
 # ============================================================
 
 def get_user_prompt(message: Message):
@@ -1310,7 +1340,6 @@ def get_user_prompt(message: Message):
     text = text.strip()
 
     if text.startswith("%"):
-
         text = text[1:].strip()
 
     return text
@@ -1323,7 +1352,7 @@ def get_user_prompt(message: Message):
 @dp.message()
 async def all_messages(message: Message):
 
-    # Команды не отправляем Gemini.
+    # Не обрабатываем команды.
 
     if message.text and message.text.startswith("/"):
         return
@@ -1334,12 +1363,11 @@ async def all_messages(message: Message):
     ):
         return
 
-    # Проверяем режим.
-
     if not should_answer(message):
         return
 
     temp_dir = None
+    generated_image_dir = None
 
     try:
 
@@ -1347,9 +1375,86 @@ async def all_messages(message: Message):
             message
         )
 
-        # ----------------------------------------------------
-        # MEDIA
-        # ----------------------------------------------------
+        # ====================================================
+        # IMAGE GENERATION
+        # ====================================================
+
+        if user_prompt and is_image_request(
+            user_prompt
+        ):
+
+            image_prompt = clean_image_prompt(
+                user_prompt
+            )
+
+            if not image_prompt:
+
+                await message.reply(
+                    "🖼 Напиши, что именно нарисовать.\n\n"
+                    "Например:\n"
+                    "<code>%нарисуй кота в космосе</code>",
+                    parse_mode="HTML",
+                )
+
+                return
+
+            await bot.send_chat_action(
+                chat_id=message.chat.id,
+                action="upload_photo",
+            )
+
+            generated_image_dir, image_path = (
+                await generate_image(
+                    image_prompt
+                )
+            )
+
+            # Сохраняем факт запроса
+            # в историю.
+
+            add_to_history(
+                chat_id=message.chat.id,
+                user_text=user_prompt,
+                assistant_text="[Сгенерировано изображение]",
+            )
+
+            # Ограничиваем историю.
+
+            limit = settings["history_limit"]
+
+            if limit > 0:
+
+                max_stored = max(
+                    limit - 1,
+                    0,
+                )
+
+                history = get_chat_history(
+                    message.chat.id
+                )
+
+                if max_stored == 0:
+
+                    history.clear()
+
+                elif len(history) > max_stored:
+
+                    del history[
+                        :len(history) - max_stored
+                    ]
+
+            await message.reply_photo(
+                photo=FSInputFile(
+                    image_path
+                ),
+                caption="🖼 Готово!",
+            )
+
+            return
+
+        # ====================================================
+        # NORMAL MEDIA
+        # ====================================================
 
         (
             temp_dir,
@@ -1359,8 +1464,6 @@ async def all_messages(message: Message):
             message
         )
 
-        # Если только файл.
-
         if not user_prompt:
 
             user_prompt = (
@@ -1369,18 +1472,10 @@ async def all_messages(message: Message):
                 "результат."
             )
 
-        # ----------------------------------------------------
-        # TYPING
-        # ----------------------------------------------------
-
         await bot.send_chat_action(
             chat_id=message.chat.id,
             action="typing",
         )
-
-        # ----------------------------------------------------
-        # GEMINI
-        # ----------------------------------------------------
 
         answer = await ask_gemini(
             chat_id=message.chat.id,
@@ -1389,9 +1484,9 @@ async def all_messages(message: Message):
             mime_type=mime_type,
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # SAVE HISTORY
-        # ----------------------------------------------------
+        # ====================================================
 
         add_to_history(
             chat_id=message.chat.id,
@@ -1399,16 +1494,9 @@ async def all_messages(message: Message):
             assistant_text=answer,
         )
 
-        # ----------------------------------------------------
-        # TRIM STORED HISTORY
-        # ----------------------------------------------------
-
         limit = settings["history_limit"]
 
         if limit > 0:
-
-            # Храним примерно столько же,
-            # сколько потенциально понадобится.
 
             max_stored = max(
                 limit - 1,
@@ -1429,9 +1517,9 @@ async def all_messages(message: Message):
                     :len(history) - max_stored
                 ]
 
-        # ----------------------------------------------------
+        # ====================================================
         # SEND RESPONSE
-        # ----------------------------------------------------
+        # ====================================================
 
         for position in range(
             0,
@@ -1470,6 +1558,13 @@ async def all_messages(message: Message):
                 ignore_errors=True,
             )
 
+        if generated_image_dir:
+
+            shutil.rmtree(
+                generated_image_dir,
+                ignore_errors=True,
+            )
+
 
 # ============================================================
 # HTML ESCAPE
@@ -1505,7 +1600,11 @@ async def main():
     )
 
     print(
-        f"Model: {settings['model']}"
+        f"Text model: {settings['model']}"
+    )
+
+    print(
+        f"Image model: {IMAGE_MODEL}"
     )
 
     print(
