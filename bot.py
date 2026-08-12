@@ -1,2353 +1,1379 @@
 import asyncio
+import io
+import logging
 import os
-import shutil
+import random
 import tempfile
-import html
+from collections import defaultdict, deque
 from pathlib import Path
 
 import aiohttp
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
+import google.generativeai as genai
+from gradio_client import Client, handle_file
+from telegram import (
+    Update,
     InlineKeyboardButton,
-    FSInputFile,
+    InlineKeyboardMarkup,
 )
-
-from google import genai
-from google.genai import types
-
-from huggingface_hub import InferenceClient
-
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
+# Только этот Telegram ID может менять глобальные настройки
 OWNER_ID = 8904429775
 
-DEFAULT_TEXT_MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.1-flash-lite"
-)
+# ------------------------------------------------------------
+# Gemini
+# ------------------------------------------------------------
 
-DEFAULT_IMAGE_MODEL = os.getenv(
-    "IMAGE_MODEL",
-    "flux"
-)
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 
-DEFAULT_VIDEO_MODEL = os.getenv(
-    "VIDEO_MODEL",
-    "Wan-AI/Wan2.2-TI2V-5B"
-)
+# ------------------------------------------------------------
+# Image
+# ------------------------------------------------------------
 
-DEFAULT_PROMPT = os.getenv(
-    "GEMINI_PROMPT",
-    "Ты полезный ИИ-ассистент. "
-    "Отвечай на языке пользователя. "
-    "Отвечай точно и понятно."
-)
+DEFAULT_IMAGE_MODEL = "flux-schnell"
 
-DEFAULT_HISTORY_LIMIT = int(
-    os.getenv("HISTORY_LIMIT", "10")
-)
+PIXAZO_URL = "https://gateway.pixazo.ai/flux-1-schnell/v1/getData"
 
-DEFAULT_ENABLED = (
-    os.getenv("BOT_ENABLED", "false").lower()
-    in ("true", "1", "yes", "on")
-)
+# ------------------------------------------------------------
+# Video
+# ------------------------------------------------------------
 
-DEFAULT_GEMINI_KEY = os.getenv(
-    "GEMINI_API_KEY",
-    ""
-)
+VIDEO_SPACE = "Lightricks/LTX-2-3"
 
-DEFAULT_HF_TOKEN = os.getenv(
-    "HF_TOKEN",
-    ""
-)
-
-DEFAULT_POLLINATIONS_KEY = os.getenv(
-    "POLLINATIONS_API_KEY",
-    ""
-)
-
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN не установлен."
-    )
-
-
-# ============================================================
-# GLOBAL SETTINGS
-# ============================================================
+# ------------------------------------------------------------
+# Global settings
+# ------------------------------------------------------------
 
 settings = {
-    "gemini_api_key": DEFAULT_GEMINI_KEY,
+    "gemini_model": DEFAULT_GEMINI_MODEL,
 
-    "hf_token": DEFAULT_HF_TOKEN,
-
-    "pollinations_api_key":
-        DEFAULT_POLLINATIONS_KEY,
-
-    "text_model": DEFAULT_TEXT_MODEL,
-
+    # Модель для картинок
     "image_model": DEFAULT_IMAGE_MODEL,
 
-    "video_model": DEFAULT_VIDEO_MODEL,
+    # Промпт / роль
+    "system_prompt": (
+        "Ты полезный Telegram AI-ассистент. "
+        "Отвечай понятно, точно и на языке пользователя."
+    ),
 
-    "prompt": DEFAULT_PROMPT,
+    # True = отвечает на все сообщения
+    # False = только если сообщение начинается с %
+    "reply_all": False,
 
-    "enabled": DEFAULT_ENABLED,
+    # 0 = без лимита
+    # 1 = фактически ничего не помнить
+    "history_limit": 20,
 
-    "history_limit": DEFAULT_HISTORY_LIMIT,
+    # API ключи вводятся владельцем через /settings
+    "gemini_api_key": "",
+    "pixazo_api_key": "",
+    "hf_token": "",
 }
-
-
-# ============================================================
-# MODELS
-# ============================================================
-
-TEXT_MODELS = {
-    "gemini-3.1-flash-lite":
-        "⚡ Gemini 3.1 Flash-Lite",
-
-    "gemini-3.6-flash":
-        "🚀 Gemini 3.6 Flash",
-}
-
-
-IMAGE_MODELS = {
-    "flux":
-        "🎨 Flux",
-
-    "nanobanana-2":
-        "🍌 Nano Banana 2",
-
-    "gptimage":
-        "🖼 GPT Image",
-
-    "seedream5":
-        "✨ Seedream 5",
-
-    "zimage":
-        "⚡ Z-Image",
-}
-
-
-VIDEO_MODELS = {
-    "Wan-AI/Wan2.2-TI2V-5B":
-        "🎥 Wan 2.2 TI2V 5B",
-
-    "tencent/HunyuanVideo":
-        "🎥 HunyuanVideo",
-
-    "Lightricks/LTX-Video-0.9.8-13B-distilled":
-        "⚡ LTX-Video",
-}
-
-
-# ============================================================
-# BOT
-# ============================================================
-
-bot = Bot(BOT_TOKEN)
-
-dp = Dispatcher()
-
-
-# ============================================================
-# STATES
-# ============================================================
-
-class SettingsState(StatesGroup):
-
-    waiting_gemini_key = State()
-
-    waiting_hf_token = State()
-
-    waiting_pollinations_key = State()
-
-    waiting_prompt = State()
-
-    waiting_history = State()
 
 
 # ============================================================
 # HISTORY
 # ============================================================
 
-# БД НЕ используется.
-#
-# После перезапуска Railway история очищается.
-
-chat_histories = {}
+# История отдельно для каждого чата
+histories = defaultdict(deque)
 
 
 def get_history(chat_id: int):
+    limit = settings["history_limit"]
 
-    if chat_id not in chat_histories:
+    if limit <= 0:
+        return histories[chat_id]
 
-        chat_histories[chat_id] = []
+    # При limit = 1 модель получает только текущее сообщение.
+    return deque(histories[chat_id], maxlen=max(0, limit - 1))
 
-    return chat_histories[chat_id]
+
+def add_history(chat_id: int, role: str, text: str):
+    limit = settings["history_limit"]
+
+    if limit == 1:
+        return
+
+    if limit <= 0:
+        # Без ограничения
+        histories[chat_id].append({
+            "role": role,
+            "text": text,
+        })
+    else:
+        histories[chat_id] = deque(
+            histories[chat_id],
+            maxlen=limit
+        )
+
+        histories[chat_id].append({
+            "role": role,
+            "text": text,
+        })
 
 
 def clear_history(chat_id: int):
-
-    chat_histories[chat_id] = []
-
-
-def save_history(
-    chat_id: int,
-    user_text: str,
-    answer: str,
-):
-
-    history = get_history(chat_id)
-
-    history.append(
-        {
-            "role": "user",
-            "text": user_text,
-        }
-    )
-
-    history.append(
-        {
-            "role": "model",
-            "text": answer,
-        }
-    )
-
-
-def trim_history(chat_id: int):
-
-    limit = settings["history_limit"]
-
-    if limit == 0:
-        return
-
-    history = get_history(chat_id)
-
-    if limit == 1:
-
-        history.clear()
-
-        return
-
-    max_items = limit * 2
-
-    if len(history) > max_items:
-
-        del history[:-max_items]
-
-
-# ============================================================
-# OWNER
-# ============================================================
-
-def is_owner(user_id: int):
-
-    return user_id == OWNER_ID
-
-
-# ============================================================
-# SETTINGS KEYBOARD
-# ============================================================
-
-def settings_keyboard():
-
-    gemini_status = (
-        "✅"
-        if settings["gemini_api_key"]
-        else "❌"
-    )
-
-    hf_status = (
-        "✅"
-        if settings["hf_token"]
-        else "❌"
-    )
-
-    pollinations_status = (
-        "✅"
-        if settings["pollinations_api_key"]
-        else "❌"
-    )
-
-    mode = (
-        "🟢 ВКЛ"
-        if settings["enabled"]
-        else "🔴 ВЫКЛ"
-    )
-
-    limit = settings["history_limit"]
-
-    history = (
-        "♾"
-        if limit == 0
-        else str(limit)
-    )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-
-            [
-                InlineKeyboardButton(
-                    text=f"🔑 Gemini API: {gemini_status}",
-                    callback_data="set_gemini_key",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text=f"🎬 Hugging Face API: {hf_status}",
-                    callback_data="set_hf_token",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text=(
-                        f"🖼 Image API: "
-                        f"{pollinations_status}"
-                    ),
-                    callback_data="set_pollinations_key",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🎭 Роль / промт",
-                    callback_data="set_prompt",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text=(
-                        "🤖 Текстовая модель\n"
-                        f"{settings['text_model']}"
-                    ),
-                    callback_data="text_models",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text=(
-                        "🖼 Модель изображений\n"
-                        f"{settings['image_model']}"
-                    ),
-                    callback_data="image_models",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text=(
-                        "🎬 Модель видео\n"
-                        f"{settings['video_model']}"
-                    ),
-                    callback_data="video_models",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text=f"{mode} — режим",
-                    callback_data="toggle_mode",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text=f"🧠 История: {history}",
-                    callback_data="history_limit",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🗑 Очистить историю",
-                    callback_data="clear_history",
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🔄 Обновить",
-                    callback_data="refresh_settings",
-                )
-            ],
-        ]
-    )
-
-
-# ============================================================
-# SETTINGS TEXT
-# ============================================================
-
-def settings_text():
-
-    gemini_status = (
-        "✅ установлен"
-        if settings["gemini_api_key"]
-        else "❌ не установлен"
-    )
-
-    hf_status = (
-        "✅ установлен"
-        if settings["hf_token"]
-        else "❌ не установлен"
-    )
-
-    image_status = (
-        "✅ установлен"
-        if settings["pollinations_api_key"]
-        else "❌ не установлен"
-    )
-
-    if settings["enabled"]:
-
-        mode = (
-            "🟢 <b>ВКЛ</b>\n"
-            "Реагирует на все сообщения."
-        )
-
-    else:
-
-        mode = (
-            "🔴 <b>ВЫКЛ</b>\n"
-            "Реагирует только на сообщения "
-            "с <code>%</code> в начале."
-        )
-
-    limit = settings["history_limit"]
-
-    if limit == 0:
-        history = "♾ без лимита"
-
-    elif limit == 1:
-        history = "1 — ничего не помнить"
-
-    else:
-        history = f"{limit} сообщений"
-
-    prompt = settings["prompt"]
-
-    if len(prompt) > 800:
-        prompt = prompt[:800] + "..."
-
-    return (
-        "⚙️ <b>Настройки бота</b>\n\n"
-
-        f"👑 Владелец: <code>{OWNER_ID}</code>\n\n"
-
-        f"🔑 Gemini API: {gemini_status}\n"
-        f"🎬 Hugging Face API: {hf_status}\n"
-        f"🖼 Image API: {image_status}\n\n"
-
-        "🤖 <b>Текст:</b>\n"
-        f"<code>{esc(settings['text_model'])}</code>\n\n"
-
-        "🖼 <b>Изображения:</b>\n"
-        f"<code>{esc(settings['image_model'])}</code>\n\n"
-
-        "🎬 <b>Видео:</b>\n"
-        f"<code>{esc(settings['video_model'])}</code>\n\n"
-
-        f"📡 <b>Режим:</b>\n{mode}\n\n"
-
-        f"🧠 <b>История:</b> {history}\n\n"
-
-        "🎭 <b>Роль:</b>\n"
-        f"<blockquote>{esc(prompt)}</blockquote>\n\n"
-
-        "🌍 Настройки глобальные и действуют "
-        "во всех чатах."
-    )
-
-
-# ============================================================
-# START
-# ============================================================
-
-@dp.message(Command("start"))
-async def start(message: Message):
-
-    await message.answer(
-        "👋 <b>Gemini AI Bot</b>\n\n"
-
-        "💬 Текст\n"
-        "📷 Анализ фото\n"
-        "🎤 Анализ аудио\n"
-        "🎥 Анализ видео\n"
-        "🖼 Генерация изображений\n"
-        "🎬 Генерация видео\n"
-        "🧠 История\n\n"
-
-        "Пример:\n"
-        "<code>%сколько будет 25 × 25?</code>\n\n"
-
-        "Картинка:\n"
-        "<code>%нарисуй кота в космосе</code>\n\n"
-
-        "Видео:\n"
-        "<code>%видео кот идёт по Алматы ночью</code>\n\n"
-
-        "Настройки:\n"
-        "<code>/settings</code>",
-
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
-@dp.message(Command("settings"))
-async def settings_command(
-    message: Message,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        message.from_user.id
-    ):
-
-        await message.answer(
-            "⛔ Настройки доступны "
-            "только владельцу."
-        )
-
-        return
-
-    await state.clear()
-
-    await message.answer(
-        settings_text(),
-        reply_markup=settings_keyboard(),
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# GEMINI KEY
-# ============================================================
-
-@dp.callback_query(
-    F.data == "set_gemini_key"
-)
-async def set_gemini_key(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    await state.set_state(
-        SettingsState.waiting_gemini_key
-    )
-
-    await callback.message.answer(
-        "🔑 Отправь Gemini API key.\n\n"
-        "Для отмены: /cancel"
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    SettingsState.waiting_gemini_key
-)
-async def receive_gemini_key(
-    message: Message,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        message.from_user.id
-    ):
-
-        await state.clear()
-
-        return
-
-    key = (
-        message.text or ""
-    ).strip()
-
-    if len(key) < 10:
-
-        await message.answer(
-            "❌ Ключ выглядит неправильно."
-        )
-
-        return
-
-    settings["gemini_api_key"] = key
-
-    await state.clear()
-
-    await message.answer(
-        "✅ Gemini API key сохранён.",
-        reply_markup=settings_keyboard(),
-    )
-
-
-# ============================================================
-# HF TOKEN
-# ============================================================
-
-@dp.callback_query(
-    F.data == "set_hf_token"
-)
-async def set_hf_token(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    await state.set_state(
-        SettingsState.waiting_hf_token
-    )
-
-    await callback.message.answer(
-        "🎬 Отправь Hugging Face Token.\n\n"
-        "Нужен токен с разрешением "
-        "<b>Inference Providers</b>.\n\n"
-        "Для отмены: /cancel",
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    SettingsState.waiting_hf_token
-)
-async def receive_hf_token(
-    message: Message,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        message.from_user.id
-    ):
-
-        await state.clear()
-
-        return
-
-    token = (
-        message.text or ""
-    ).strip()
-
-    if not token.startswith("hf_"):
-
-        await message.answer(
-            "❌ Hugging Face Token "
-            "обычно начинается с hf_."
-        )
-
-        return
-
-    settings["hf_token"] = token
-
-    await state.clear()
-
-    await message.answer(
-        "✅ Hugging Face token сохранён.",
-        reply_markup=settings_keyboard(),
-    )
-
-
-# ============================================================
-# POLLINATIONS KEY
-# ============================================================
-
-@dp.callback_query(
-    F.data == "set_pollinations_key"
-)
-async def set_pollinations_key(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    await state.set_state(
-        SettingsState.waiting_pollinations_key
-    )
-
-    await callback.message.answer(
-        "🖼 Отправь Pollinations API key.\n\n"
-
-        "Для генерации через API нужен ключ.\n\n"
-
-        "Официальная страница ключей:\n"
-        "https://enter.pollinations.ai\n\n"
-
-        "Для отмены: /cancel",
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    SettingsState.waiting_pollinations_key
-)
-async def receive_pollinations_key(
-    message: Message,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        message.from_user.id
-    ):
-
-        await state.clear()
-
-        return
-
-    key = (
-        message.text or ""
-    ).strip()
-
-    if not (
-        key.startswith("sk_")
-        or key.startswith("pk_")
-    ):
-
-        await message.answer(
-            "❌ Pollinations key должен "
-            "начинаться с sk_ или pk_."
-        )
-
-        return
-
-    settings[
-        "pollinations_api_key"
-    ] = key
-
-    await state.clear()
-
-    await message.answer(
-        "✅ Pollinations API key сохранён.",
-        reply_markup=settings_keyboard(),
-    )
-
-
-# ============================================================
-# PROMPT
-# ============================================================
-
-@dp.callback_query(
-    F.data == "set_prompt"
-)
-async def set_prompt(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    await state.set_state(
-        SettingsState.waiting_prompt
-    )
-
-    await callback.message.answer(
-        "🎭 Отправь новую роль / system prompt.\n\n"
-        "Например:\n"
-        "<code>"
-        "Ты профессиональный программист. "
-        "Отвечай кратко и по делу."
-        "</code>\n\n"
-        "Для отмены: /cancel",
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    SettingsState.waiting_prompt
-)
-async def receive_prompt(
-    message: Message,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        message.from_user.id
-    ):
-
-        await state.clear()
-
-        return
-
-    if not message.text:
-
-        await message.answer(
-            "❌ Отправь текстовый промт."
-        )
-
-        return
-
-    settings["prompt"] = (
-        message.text.strip()
-    )
-
-    await state.clear()
-
-    await message.answer(
-        "✅ Роль изменена.",
-        reply_markup=settings_keyboard(),
-    )
-
-
-# ============================================================
-# TEXT MODELS
-# ============================================================
-
-def text_models_keyboard():
-
-    rows = []
-
-    for model, name in TEXT_MODELS.items():
-
-        mark = (
-            " ✅"
-            if model == settings["text_model"]
-            else ""
-        )
-
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=name + mark,
-                    callback_data=f"tm:{model}",
-                )
-            ]
-        )
-
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="⬅️ Назад",
-                callback_data="back_settings",
-            )
-        ]
-    )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=rows
-    )
-
-
-@dp.callback_query(
-    F.data == "text_models"
-)
-async def text_models(
-    callback: CallbackQuery,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    await callback.message.edit_text(
-        "🤖 <b>Текстовая модель</b>\n\n"
-        "Выбери модель:",
-
-        reply_markup=text_models_keyboard(),
-
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("tm:")
-)
-async def choose_text_model(
-    callback: CallbackQuery,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    model = callback.data[3:]
-
-    if model not in TEXT_MODELS:
-
-        await callback.answer(
-            "❌ Неизвестная модель.",
-            show_alert=True,
-        )
-
-        return
-
-    settings["text_model"] = model
-
-    await callback.message.edit_text(
-        settings_text(),
-        reply_markup=settings_keyboard(),
-        parse_mode="HTML",
-    )
-
-    await callback.answer(
-        "✅ Текстовая модель изменена."
-    )
-
-
-# ============================================================
-# IMAGE MODELS
-# ============================================================
-
-def image_models_keyboard():
-
-    rows = []
-
-    for model, name in IMAGE_MODELS.items():
-
-        mark = (
-            " ✅"
-            if model == settings["image_model"]
-            else ""
-        )
-
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=name + mark,
-                    callback_data=f"im:{model}",
-                )
-            ]
-        )
-
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="⬅️ Назад",
-                callback_data="back_settings",
-            )
-        ]
-    )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=rows
-    )
-
-
-@dp.callback_query(
-    F.data == "image_models"
-)
-async def image_models(
-    callback: CallbackQuery,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    await callback.message.edit_text(
-        "🖼 <b>Модель изображений</b>\n\n"
-        "Выбери модель:",
-
-        reply_markup=image_models_keyboard(),
-
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("im:")
-)
-async def choose_image_model(
-    callback: CallbackQuery,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    model = callback.data[3:]
-
-    if model not in IMAGE_MODELS:
-
-        await callback.answer(
-            "❌ Неизвестная модель.",
-            show_alert=True,
-        )
-
-        return
-
-    settings["image_model"] = model
-
-    await callback.message.edit_text(
-        settings_text(),
-        reply_markup=settings_keyboard(),
-        parse_mode="HTML",
-    )
-
-    await callback.answer(
-        "✅ Image-модель изменена."
-    )
-
-
-# ============================================================
-# VIDEO MODELS
-# ============================================================
-
-def video_models_keyboard():
-
-    rows = []
-
-    for model, name in VIDEO_MODELS.items():
-
-        mark = (
-            " ✅"
-            if model == settings["video_model"]
-            else ""
-        )
-
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=name + mark,
-                    callback_data=f"vm:{model}",
-                )
-            ]
-        )
-
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="⬅️ Назад",
-                callback_data="back_settings",
-            )
-        ]
-    )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=rows
-    )
-
-
-@dp.callback_query(
-    F.data == "video_models"
-)
-async def video_models(
-    callback: CallbackQuery,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    await callback.message.edit_text(
-        "🎬 <b>Модель видео</b>\n\n"
-        "Выбери модель:",
-
-        reply_markup=video_models_keyboard(),
-
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("vm:")
-)
-async def choose_video_model(
-    callback: CallbackQuery,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    model = callback.data[3:]
-
-    if model not in VIDEO_MODELS:
-
-        await callback.answer(
-            "❌ Неизвестная модель.",
-            show_alert=True,
-        )
-
-        return
-
-    settings["video_model"] = model
-
-    await callback.message.edit_text(
-        settings_text(),
-        reply_markup=settings_keyboard(),
-        parse_mode="HTML",
-    )
-
-    await callback.answer(
-        "✅ Video-модель изменена."
-    )
-
-
-# ============================================================
-# TOGGLE
-# ============================================================
-
-@dp.callback_query(
-    F.data == "toggle_mode"
-)
-async def toggle_mode(
-    callback: CallbackQuery,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    settings["enabled"] = (
-        not settings["enabled"]
-    )
-
-    await callback.message.edit_text(
-        settings_text(),
-        reply_markup=settings_keyboard(),
-        parse_mode="HTML",
-    )
-
-    await callback.answer(
-        "✅ Режим изменён."
-    )
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-@dp.callback_query(
-    F.data == "history_limit"
-)
-async def history_limit(
-    callback: CallbackQuery,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    await state.set_state(
-        SettingsState.waiting_history
-    )
-
-    await callback.message.answer(
-        "🧠 <b>Лимит истории</b>\n\n"
-
-        "0 — без лимита\n"
-        "1 — ничего не помнить\n"
-        "5 — примерно 5 сообщений\n"
-        "20 — примерно 20 сообщений\n\n"
-
-        "Для отмены: /cancel",
-
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    SettingsState.waiting_history
-)
-async def receive_history_limit(
-    message: Message,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        message.from_user.id
-    ):
-
-        await state.clear()
-
-        return
-
-    try:
-
-        value = int(
-            message.text.strip()
-        )
-
-    except Exception:
-
-        await message.answer(
-            "❌ Отправь целое число."
-        )
-
-        return
-
-    if value < 0:
-
-        await message.answer(
-            "❌ Значение не может быть "
-            "меньше 0."
-        )
-
-        return
-
-    settings["history_limit"] = value
-
-    await state.clear()
-
-    await message.answer(
-        f"✅ Лимит истории: "
-        f"<b>{value}</b>",
-
-        reply_markup=settings_keyboard(),
-
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# CLEAR HISTORY
-# ============================================================
-
-@dp.callback_query(
-    F.data == "clear_history"
-)
-async def clear_history_callback(
-    callback: CallbackQuery,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-
-        return
-
-    clear_history(
-        callback.message.chat.id
-    )
-
-    await callback.answer(
-        "🗑 История текущего чата очищена.",
-        show_alert=True,
-    )
-
-
-# ============================================================
-# REFRESH / BACK
-# ============================================================
-
-@dp.callback_query(
-    F.data == "refresh_settings"
-)
-async def refresh_settings(
-    callback: CallbackQuery,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-        return
-
-    await callback.message.edit_text(
-        settings_text(),
-        reply_markup=settings_keyboard(),
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(
-    F.data == "back_settings"
-)
-async def back_settings(
-    callback: CallbackQuery,
-):
-
-    if not is_owner(
-        callback.from_user.id
-    ):
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True,
-        )
-        return
-
-    await callback.message.edit_text(
-        settings_text(),
-        reply_markup=settings_keyboard(),
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# CANCEL
-# ============================================================
-
-@dp.message(Command("cancel"))
-async def cancel(
-    message: Message,
-    state: FSMContext,
-):
-
-    if not is_owner(
-        message.from_user.id
-    ):
-        return
-
-    await state.clear()
-
-    await message.answer(
-        "❌ Отменено."
-    )
-
-
-# ============================================================
-# TELEGRAM MEDIA DOWNLOAD
-# ============================================================
-
-async def download_media(
-    message: Message,
-):
-
-    temp_dir = Path(
-        tempfile.mkdtemp(
-            prefix="tg_gemini_"
-        )
-    )
-
-    if message.photo:
-
-        file = await bot.get_file(
-            message.photo[-1].file_id
-        )
-
-        path = temp_dir / "photo.jpg"
-
-        await bot.download_file(
-            file.file_path,
-            destination=path,
-        )
-
-        return (
-            temp_dir,
-            path,
-            "image/jpeg",
-        )
-
-    if message.voice:
-
-        file = await bot.get_file(
-            message.voice.file_id
-        )
-
-        path = temp_dir / "voice.ogg"
-
-        await bot.download_file(
-            file.file_path,
-            destination=path,
-        )
-
-        return (
-            temp_dir,
-            path,
-            "audio/ogg",
-        )
-
-    if message.audio:
-
-        file = await bot.get_file(
-            message.audio.file_id
-        )
-
-        filename = (
-            message.audio.file_name
-            or "audio.mp3"
-        )
-
-        path = temp_dir / filename
-
-        await bot.download_file(
-            file.file_path,
-            destination=path,
-        )
-
-        return (
-            temp_dir,
-            path,
-            message.audio.mime_type
-            or "audio/mpeg",
-        )
-
-    if message.video:
-
-        file = await bot.get_file(
-            message.video.file_id
-        )
-
-        path = temp_dir / "video.mp4"
-
-        await bot.download_file(
-            file.file_path,
-            destination=path,
-        )
-
-        return (
-            temp_dir,
-            path,
-            message.video.mime_type
-            or "video/mp4",
-        )
-
-    if message.video_note:
-
-        file = await bot.get_file(
-            message.video_note.file_id
-        )
-
-        path = temp_dir / "video_note.mp4"
-
-        await bot.download_file(
-            file.file_path,
-            destination=path,
-        )
-
-        return (
-            temp_dir,
-            path,
-            "video/mp4",
-        )
-
-    if message.document:
-
-        file = await bot.get_file(
-            message.document.file_id
-        )
-
-        filename = (
-            message.document.file_name
-            or "file"
-        )
-
-        path = temp_dir / filename
-
-        await bot.download_file(
-            file.file_path,
-            destination=path,
-        )
-
-        return (
-            temp_dir,
-            path,
-            message.document.mime_type
-            or "application/octet-stream",
-        )
-
-    shutil.rmtree(
-        temp_dir,
-        ignore_errors=True,
-    )
-
-    return None, None, None
+    histories[chat_id].clear()
 
 
 # ============================================================
 # GEMINI
 # ============================================================
 
-async def ask_gemini(
-    chat_id: int,
-    prompt: str,
-    media_path=None,
-    mime_type=None,
-):
+def configure_gemini():
+    key = settings["gemini_api_key"]
 
-    if not settings["gemini_api_key"]:
-
+    if not key:
         raise RuntimeError(
-            "Gemini API key не установлен.\n"
-            "Открой /settings."
+            "Gemini API ключ не установлен. "
+            "Владелец должен открыть /settings."
         )
 
-    client = genai.Client(
-        api_key=settings["gemini_api_key"]
-    )
+    genai.configure(api_key=key)
 
-    contents = []
+
+async def gemini_text(
+    chat_id: int,
+    user_text: str,
+):
+    configure_gemini()
+
+    model = genai.GenerativeModel(
+        settings["gemini_model"],
+        system_instruction=settings["system_prompt"],
+    )
 
     history = get_history(chat_id)
 
-    limit = settings["history_limit"]
+    messages = []
 
-    if limit == 0:
+    for item in history:
+        role = "user" if item["role"] == "user" else "model"
 
-        selected = history
+        messages.append({
+            "role": role,
+            "parts": [item["text"]],
+        })
 
-    elif limit == 1:
+    messages.append({
+        "role": "user",
+        "parts": [user_text],
+    })
 
-        selected = []
+    response = await asyncio.to_thread(
+        model.generate_content,
+        messages,
+    )
 
-    else:
+    answer = response.text
 
-        selected = history[
-            -(limit * 2):
-        ]
+    add_history(chat_id, "user", user_text)
+    add_history(chat_id, "assistant", answer)
 
-    for item in selected:
+    return answer
 
-        contents.append(
-            types.Content(
-                role=item["role"],
-                parts=[
-                    types.Part.from_text(
-                        text=item["text"]
-                    )
-                ],
-            )
+
+# ============================================================
+# GEMINI IMAGE / MEDIA UNDERSTANDING
+# ============================================================
+
+async def gemini_media(
+    chat_id: int,
+    prompt: str,
+    media_bytes: bytes,
+    mime_type: str,
+):
+    configure_gemini()
+
+    model = genai.GenerativeModel(
+        settings["gemini_model"],
+        system_instruction=settings["system_prompt"],
+    )
+
+    history = get_history(chat_id)
+
+    text_parts = []
+
+    for item in history:
+        text_parts.append(
+            f"{item['role']}: {item['text']}"
         )
 
-    current_parts = [
-        types.Part.from_text(
-            text=prompt
+    context = "\n".join(text_parts)
+
+    full_prompt = f"""
+Предыдущая история:
+{context}
+
+Пользователь отправил медиа.
+
+Запрос пользователя:
+{prompt}
+
+Проанализируй медиа и ответь пользователю.
+"""
+
+    response = await asyncio.to_thread(
+        model.generate_content,
+        [
+            full_prompt,
+            {
+                "mime_type": mime_type,
+                "data": media_bytes,
+            },
+        ],
+    )
+
+    answer = response.text
+
+    add_history(chat_id, "user", prompt)
+    add_history(chat_id, "assistant", answer)
+
+    return answer
+
+
+# ============================================================
+# PIXAZO IMAGE
+# ============================================================
+
+async def generate_image(prompt: str):
+    api_key = settings["pixazo_api_key"]
+
+    if not api_key:
+        raise RuntimeError(
+            "Pixazo API ключ не установлен."
         )
-    ]
 
-    if media_path:
+    headers = {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "Ocp-Apim-Subscription-Key": api_key,
+    }
 
-        file_size = media_path.stat().st_size
+    data = {
+        "prompt": prompt,
+        "num_steps": 4,
+        "height": 1024,
+        "width": 1024,
+        "seed": random.randint(1, 2_000_000_000),
+    }
 
-        if file_size <= 20 * 1024 * 1024:
+    timeout = aiohttp.ClientTimeout(total=120)
 
-            data = await asyncio.to_thread(
-                media_path.read_bytes
-            )
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            PIXAZO_URL,
+            headers=headers,
+            json=data,
+        ) as response:
 
-            current_parts.append(
-                types.Part.from_bytes(
-                    data=data,
-                    mime_type=mime_type,
+            text = await response.text()
+
+            if response.status != 200:
+                raise RuntimeError(
+                    f"Pixazo HTTP {response.status}: {text}"
                 )
+
+            try:
+                result = await response.json()
+            except Exception:
+                raise RuntimeError(
+                    f"Pixazo вернул некорректный ответ: {text}"
+                )
+
+    image_url = result.get("output")
+
+    if not image_url:
+        raise RuntimeError(
+            f"Pixazo не вернул картинку: {result}"
+        )
+
+    return image_url
+
+
+# ============================================================
+# LTX VIDEO
+# ============================================================
+
+def generate_video_sync(prompt: str):
+    """
+    Генерация через официальный Hugging Face Space
+    Lightricks/LTX-2-3.
+
+    Мы специально используем:
+    - 2 секунды
+    - low resolution
+    - без лишней нагрузки
+
+    Это повышает шанс пройти бесплатный ZeroGPU.
+    """
+
+    client_kwargs = {}
+
+    hf_token = settings.get("hf_token")
+
+    if hf_token:
+        client_kwargs["hf_token"] = hf_token
+
+    client = Client(
+        VIDEO_SPACE,
+        **client_kwargs,
+    )
+
+    # У Lightricks Space интерфейс содержит:
+    #
+    # input_image
+    # prompt
+    # duration
+    # enhance_prompt
+    # high_res
+    # seed
+    # randomize_seed
+    # width
+    # height
+    #
+    # Для text-to-video image = None.
+
+    seed = random.randint(1, 2_000_000_000)
+
+    result = client.predict(
+        None,       # input_image
+        prompt,     # prompt
+        2.0,        # duration
+        False,      # enhance_prompt
+        False,      # high_res
+        seed,       # seed
+        True,       # randomize_seed
+        768,        # width
+        512,        # height
+        api_name="/generate_video",
+    )
+
+    if isinstance(result, (list, tuple)):
+        video_path = result[0]
+    else:
+        video_path = result
+
+    if not video_path:
+        raise RuntimeError(
+            "LTX Space не вернул видео."
+        )
+
+    return video_path
+
+
+async def generate_video(prompt: str):
+    return await asyncio.to_thread(
+        generate_video_sync,
+        prompt,
+    )
+
+
+# ============================================================
+# SETTINGS UI
+# ============================================================
+
+def settings_keyboard():
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🤖 Gemini",
+                callback_data="set_gemini"
+            ),
+            InlineKeyboardButton(
+                "🖼 Фото",
+                callback_data="set_image"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🎬 Видео",
+                callback_data="set_video"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📝 Роль / промпт",
+                callback_data="set_prompt"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🧠 История",
+                callback_data="history_menu"
+            ),
+            InlineKeyboardButton(
+                "🗑 Очистить историю",
+                callback_data="clear_history_all"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "⚡ Реагировать на все",
+                callback_data="reply_all_on"
+            ),
+            InlineKeyboardButton(
+                "％ Только %",
+                callback_data="reply_all_off"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔑 API ключи",
+                callback_data="api_menu"
+            ),
+        ],
+    ])
+
+
+async def settings_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text(
+            "❌ У тебя нет доступа к настройкам."
+        )
+        return
+
+    await update.message.reply_text(
+        "⚙️ Глобальные настройки бота\n\n"
+        f"🤖 Gemini: `{settings['gemini_model']}`\n"
+        f"🖼 Фото: `{settings['image_model']}`\n"
+        f"🎬 Видео: `{VIDEO_SPACE}`\n\n"
+        f"⚡ Реакция на все: "
+        f"{'ВКЛ' if settings['reply_all'] else 'ВЫКЛ'}\n"
+        f"🧠 Лимит истории: "
+        f"{settings['history_limit']}\n\n"
+        "Все эти настройки распространяются на все чаты.",
+        reply_markup=settings_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================
+# SETTINGS CALLBACKS
+# ============================================================
+
+async def settings_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != OWNER_ID:
+        await query.edit_message_text(
+            "❌ Только владелец может менять настройки."
+        )
+        return
+
+    data = query.data
+
+    if data == "reply_all_on":
+
+        settings["reply_all"] = True
+
+        await query.edit_message_text(
+            "✅ Реакция на все сообщения ВКЛ.\n\n"
+            "Теперь бот отвечает на обычные сообщения "
+            "во всех чатах."
+        )
+
+    elif data == "reply_all_off":
+
+        settings["reply_all"] = False
+
+        await query.edit_message_text(
+            "✅ Режим `%` ВКЛ.\n\n"
+            "Теперь бот отвечает только на сообщения, "
+            "начинающиеся с `%`."
+        )
+
+    elif data == "clear_history_all":
+
+        histories.clear()
+
+        await query.edit_message_text(
+            "🗑 История всех чатов очищена."
+        )
+
+    elif data == "set_gemini":
+
+        context.user_data["waiting"] = "gemini_model"
+
+        await query.edit_message_text(
+            "🤖 Отправь название Gemini-модели.\n\n"
+            "Например:\n"
+            "`gemini-3.5-flash`\n\n"
+            "Для отмены: /cancel",
+            parse_mode="Markdown",
+        )
+
+    elif data == "set_image":
+
+        await query.edit_message_text(
+            "🖼 Модель фото:\n\n"
+            "Текущая: `Flux Schnell`\n\n"
+            "Она используется через бесплатный "
+            "Pixazo API.\n\n"
+            "Модель фиксирована в этой версии.",
+            parse_mode="Markdown",
+        )
+
+    elif data == "set_video":
+
+        await query.edit_message_text(
+            "🎬 Видео:\n\n"
+            "Lightricks LTX-2.3\n"
+            "Hugging Face ZeroGPU\n\n"
+            "Короткое видео генерируется через "
+            "бесплатный Space.\n\n"
+            "Модель: LTX-2.3 Distilled"
+        )
+
+    elif data == "set_prompt":
+
+        context.user_data["waiting"] = "system_prompt"
+
+        await query.edit_message_text(
+            "📝 Отправь новую роль / системный промпт.\n\n"
+            "Например:\n"
+            "`Ты эксперт по программированию...`\n\n"
+            "Для отмены: /cancel",
+            parse_mode="Markdown",
+        )
+
+    elif data == "history_menu":
+
+        context.user_data["waiting"] = "history_limit"
+
+        await query.edit_message_text(
+            "🧠 Отправь число сообщений для памяти.\n\n"
+            "`0` — без лимита\n"
+            "`1` — ничего не помнить\n"
+            "`10` — помнить последние 10\n"
+            "`20` — помнить последние 20\n\n"
+            "Для отмены: /cancel",
+            parse_mode="Markdown",
+        )
+
+    elif data == "api_menu":
+
+        context.user_data["waiting"] = "api_menu"
+
+        await query.edit_message_text(
+            "🔑 API ключи\n\n"
+            "Отправь одну из команд:\n\n"
+            "`gemini: ТВОЙ_КЛЮЧ`\n"
+            "`pixazo: ТВОЙ_КЛЮЧ`\n"
+            "`hf: ТВОЙ_ТОКЕН`\n\n"
+            "Для отмены: /cancel",
+            parse_mode="Markdown",
+        )
+
+
+# ============================================================
+# SETTINGS INPUT
+# ============================================================
+
+async def settings_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if update.effective_user.id != OWNER_ID:
+        return
+
+    waiting = context.user_data.get("waiting")
+
+    if not waiting:
+        return
+
+    text = update.message.text.strip()
+
+    if waiting == "gemini_model":
+
+        settings["gemini_model"] = text
+
+        context.user_data.pop("waiting", None)
+
+        await update.message.reply_text(
+            f"✅ Gemini модель изменена:\n`{text}`",
+            parse_mode="Markdown",
+        )
+
+    elif waiting == "system_prompt":
+
+        settings["system_prompt"] = text
+
+        context.user_data.pop("waiting", None)
+
+        await update.message.reply_text(
+            "✅ Роль / системный промпт изменён."
+        )
+
+    elif waiting == "history_limit":
+
+        try:
+            value = int(text)
+
+            if value < 0:
+                raise ValueError
+
+        except ValueError:
+
+            await update.message.reply_text(
+                "❌ Нужно отправить целое число."
             )
+            return
+
+        settings["history_limit"] = value
+
+        # Пересоздаём deque
+        for chat_id in list(histories.keys()):
+
+            if value > 1:
+                histories[chat_id] = deque(
+                    histories[chat_id],
+                    maxlen=value
+                )
+            elif value == 1:
+                histories[chat_id].clear()
+
+        context.user_data.pop("waiting", None)
+
+        await update.message.reply_text(
+            f"✅ Лимит истории: `{value}`",
+            parse_mode="Markdown",
+        )
+
+    elif waiting == "api_menu":
+
+        if ":" not in text:
+
+            await update.message.reply_text(
+                "❌ Формат:\n"
+                "`gemini: ключ`\n"
+                "`pixazo: ключ`\n"
+                "`hf: токен`",
+                parse_mode="Markdown",
+            )
+            return
+
+        name, value = text.split(":", 1)
+
+        name = name.strip().lower()
+        value = value.strip()
+
+        if not value:
+
+            await update.message.reply_text(
+                "❌ Ключ пустой."
+            )
+            return
+
+        if name == "gemini":
+
+            settings["gemini_api_key"] = value
+            message = "🤖 Gemini API ключ сохранён."
+
+        elif name == "pixazo":
+
+            settings["pixazo_api_key"] = value
+            message = "🖼 Pixazo API ключ сохранён."
+
+        elif name == "hf":
+
+            settings["hf_token"] = value
+            message = "🎬 Hugging Face токен сохранён."
 
         else:
 
-            uploaded = await asyncio.to_thread(
-                lambda: client.files.upload(
-                    file=str(media_path),
-                    config=types.UploadFileConfig(
-                        mime_type=mime_type
-                    ),
-                )
+            await update.message.reply_text(
+                "❌ Неизвестный тип ключа."
             )
+            return
 
-            current_parts.append(
-                uploaded
-            )
+        context.user_data.pop("waiting", None)
 
-    contents.append(
-        types.Content(
-            role="user",
-            parts=current_parts,
+        await update.message.reply_text(
+            f"✅ {message}"
         )
-    )
-
-    response = await asyncio.to_thread(
-        client.models.generate_content,
-
-        model=settings["text_model"],
-
-        contents=contents,
-
-        config=types.GenerateContentConfig(
-            system_instruction=settings["prompt"]
-        ),
-    )
-
-    return response.text or (
-        "❌ Gemini не вернул текст."
-    )
 
 
 # ============================================================
-# IMAGE REQUEST
+# CANCEL
 # ============================================================
 
-def is_image_request(
-    text: str
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    text = text.lower().strip()
+    context.user_data.pop("waiting", None)
 
-    prefixes = [
-        "нарисуй",
-        "сгенерируй фото",
-        "сгенерируй картинку",
-        "сгенерируй изображение",
-        "создай фото",
-        "создай картинку",
-        "создай изображение",
-        "сделай фото",
-        "сделай картинку",
-        "сделай изображение",
-        "изобрази",
-        "draw",
-        "generate image",
-        "create image",
-    ]
-
-    return any(
-        text.startswith(prefix)
-        for prefix in prefixes
+    await update.message.reply_text(
+        "❌ Отменено."
     )
-
-
-def clean_image_prompt(
-    text: str
-):
-
-    text = text.strip()
-
-    prefixes = [
-        "нарисуй",
-        "сгенерируй фото",
-        "сгенерируй картинку",
-        "сгенерируй изображение",
-        "создай фото",
-        "создай картинку",
-        "создай изображение",
-        "сделай фото",
-        "сделай картинку",
-        "сделай изображение",
-        "изобрази",
-        "draw",
-        "generate image",
-        "create image",
-    ]
-
-    lower = text.lower()
-
-    for prefix in prefixes:
-
-        if lower.startswith(prefix):
-
-            return text[
-                len(prefix):
-            ].strip()
-
-    return text
 
 
 # ============================================================
-# POLLINATIONS IMAGE
+# PHOTO GENERATION COMMAND
 # ============================================================
 
-async def generate_image(
-    prompt: str
+async def image_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    api_key = settings[
-        "pollinations_api_key"
-    ]
+    if not context.args:
 
-    if not api_key:
-
-        raise RuntimeError(
-            "Pollinations API key "
-            "не установлен.\n\n"
-            "Открой /settings → "
-            "🖼 Image API."
+        await update.message.reply_text(
+            "Использование:\n"
+            "`/image кот в космосе`",
+            parse_mode="Markdown",
         )
+        return
 
-    model = settings[
-        "image_model"
-    ]
+    prompt = " ".join(context.args)
 
-    encoded_prompt = (
-        prompt
-    )
-
-    url = (
-        "https://gen.pollinations.ai/image/"
-        + aiohttp.helpers.quote(
-            encoded_prompt,
-            safe=""
-        )
-    )
-
-    params = {
-        "model": model,
-
-        "width": "1024",
-
-        "height": "1024",
-
-        "nologo": "true",
-    }
-
-    headers = {
-        "Authorization":
-            f"Bearer {api_key}",
-    }
-
-    timeout = aiohttp.ClientTimeout(
-        total=300
-    )
-
-    temp_dir = Path(
-        tempfile.mkdtemp(
-            prefix="generated_image_"
-        )
-    )
-
-    image_path = (
-        temp_dir / "image.jpg"
+    await update.message.chat.send_action(
+        ChatAction.UPLOAD_PHOTO
     )
 
     try:
 
-        async with aiohttp.ClientSession(
-            timeout=timeout
-        ) as session:
+        image_url = await generate_image(prompt)
 
-            async with session.get(
-                url,
-                params=params,
-                headers=headers,
-            ) as response:
-
-                data = await response.read()
-
-                if response.status != 200:
-
-                    error_text = (
-                        data.decode(
-                            "utf-8",
-                            errors="ignore"
-                        )
-                    )
-
-                    raise RuntimeError(
-                        f"Pollinations HTTP "
-                        f"{response.status}: "
-                        f"{error_text[:2000]}"
-                    )
-
-                content_type = (
-                    response.headers.get(
-                        "Content-Type",
-                        ""
-                    )
-                )
-
-                if not content_type.startswith(
-                    "image/"
-                ):
-
-                    text = data.decode(
-                        "utf-8",
-                        errors="ignore"
-                    )
-
-                    raise RuntimeError(
-                        "Pollinations вернул "
-                        "не изображение:\n"
-                        + text[:2000]
-                    )
-
-                image_path.write_bytes(
-                    data
-                )
-
-        return (
-            temp_dir,
-            image_path,
+        await update.message.reply_photo(
+            photo=image_url,
+            caption=f"🖼 {prompt}"
         )
 
-    except Exception:
+    except Exception as e:
 
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True,
+        logging.exception("IMAGE ERROR")
+
+        await update.message.reply_text(
+            f"❌ Ошибка генерации изображения:\n\n{e}"
         )
-
-        raise
 
 
 # ============================================================
-# VIDEO
+# VIDEO COMMAND
 # ============================================================
 
-def is_video_request(
-    text: str
+async def video_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    text = text.lower().strip()
+    if not context.args:
 
-    prefixes = [
-        "видео",
-        "сгенерируй видео",
-        "создай видео",
-        "сделай видео",
-        "generate video",
-        "create video",
-        "video",
-    ]
+        await update.message.reply_text(
+            "Использование:\n"
+            "`/video кот идёт по улице ночью`",
+            parse_mode="Markdown",
+        )
+        return
 
-    return any(
-        text.startswith(prefix)
-        for prefix in prefixes
+    prompt = " ".join(context.args)
+
+    status = await update.message.reply_text(
+        "🎬 Генерирую видео...\n\n"
+        "⏳ Используется бесплатный Hugging Face "
+        "ZeroGPU Space.\n"
+        "Это может занять некоторое время."
     )
 
+    try:
 
-def clean_video_prompt(
-    text: str
-):
+        video_path = await generate_video(prompt)
 
-    text = text.strip()
+        await status.delete()
 
-    prefixes = [
-        "видео",
-        "сгенерируй видео",
-        "создай видео",
-        "сделай видео",
-        "generate video",
-        "create video",
-        "video",
-    ]
-
-    lower = text.lower()
-
-    for prefix in prefixes:
-
-        if lower.startswith(prefix):
-
-            return text[
-                len(prefix):
-            ].strip()
-
-    return text
-
-
-async def generate_video(
-    prompt: str
-):
-
-    if not settings["hf_token"]:
-
-        raise RuntimeError(
-            "Hugging Face token "
-            "не установлен."
+        await update.message.chat.send_action(
+            ChatAction.UPLOAD_VIDEO
         )
 
-    # ВИДЕО НЕ МЕНЯЕМ.
-    # Оставляем текущую реализацию.
-
-    client = InferenceClient(
-        provider="fal-ai",
-        api_key=settings["hf_token"],
-    )
-
-    video_bytes = await asyncio.to_thread(
-        lambda: client.text_to_video(
-            prompt,
-            model=settings["video_model"],
-        )
-    )
-
-    if not video_bytes:
-
-        raise RuntimeError(
-            "Video API не вернуло видео."
+        await update.message.reply_video(
+            video=video_path,
+            caption="🎬 Готово!"
         )
 
-    temp_dir = Path(
-        tempfile.mkdtemp(
-            prefix="generated_video_"
+        # Удаляем временный файл
+        try:
+            Path(video_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    except Exception as e:
+
+        logging.exception("VIDEO ERROR")
+
+        await status.edit_text(
+            f"❌ Ошибка генерации видео:\n\n{e}"
         )
-    )
-
-    video_path = (
-        temp_dir / "video.mp4"
-    )
-
-    if hasattr(
-        video_bytes,
-        "read"
-    ):
-
-        data = video_bytes.read()
-
-    else:
-
-        data = bytes(video_bytes)
-
-    video_path.write_bytes(
-        data
-    )
-
-    return (
-        temp_dir,
-        video_path,
-    )
 
 
 # ============================================================
-# SHOULD ANSWER
+# TEXT MESSAGE
 # ============================================================
 
-def should_answer(
-    message: Message
-):
+def should_answer(text: str):
 
-    if settings["enabled"]:
-
+    if settings["reply_all"]:
         return True
-
-    text = (
-        message.text
-        or message.caption
-        or ""
-    )
 
     return text.startswith("%")
 
 
-def get_user_text(
-    message: Message
+async def text_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    text = (
-        message.text
-        or message.caption
-        or ""
+    if not update.message:
+        return
+
+    text = update.message.text
+
+    if not text:
+        return
+
+    # Если владелец сейчас вводит настройки
+    if update.effective_user.id == OWNER_ID:
+        if context.user_data.get("waiting"):
+            await settings_input(update, context)
+            return
+
+    if not should_answer(text):
+        return
+
+    prompt = text
+
+    if not settings["reply_all"]:
+
+        prompt = text[1:].strip()
+
+        if not prompt:
+            return
+
+    # --------------------------------------------------------
+    # Генерация изображения
+    # --------------------------------------------------------
+
+    image_commands = [
+        "нарисуй",
+        "сгенерируй картинку",
+        "создай картинку",
+        "создай изображение",
+        "нарисуй фото",
+    ]
+
+    lower = prompt.lower()
+
+    if any(
+        lower.startswith(x)
+        for x in image_commands
+    ):
+
+        image_prompt = prompt
+
+        for prefix in image_commands:
+
+            if lower.startswith(prefix):
+
+                image_prompt = prompt[
+                    len(prefix):
+                ].strip()
+
+                break
+
+        await update.message.chat.send_action(
+            ChatAction.UPLOAD_PHOTO
+        )
+
+        try:
+
+            image_url = await generate_image(
+                image_prompt
+            )
+
+            await update.message.reply_photo(
+                photo=image_url,
+                caption="🖼 Готово!"
+            )
+
+        except Exception as e:
+
+            logging.exception("IMAGE ERROR")
+
+            await update.message.reply_text(
+                f"❌ Ошибка:\n\n{e}"
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # Генерация видео
+    # --------------------------------------------------------
+
+    video_commands = [
+        "сгенерируй видео",
+        "создай видео",
+        "сделай видео",
+        "видео",
+    ]
+
+    if any(
+        lower.startswith(x)
+        for x in video_commands
+    ):
+
+        video_prompt = prompt
+
+        for prefix in video_commands:
+
+            if lower.startswith(prefix):
+
+                video_prompt = prompt[
+                    len(prefix):
+                ].strip()
+
+                break
+
+        status = await update.message.reply_text(
+            "🎬 Генерирую видео..."
+        )
+
+        try:
+
+            video_path = await generate_video(
+                video_prompt
+            )
+
+            await status.delete()
+
+            await update.message.reply_video(
+                video=video_path,
+                caption="🎬 Готово!"
+            )
+
+            try:
+                Path(video_path).unlink(
+                    missing_ok=True
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
+
+            logging.exception("VIDEO ERROR")
+
+            await status.edit_text(
+                f"❌ Ошибка:\n\n{e}"
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # Обычный Gemini
+    # --------------------------------------------------------
+
+    await update.message.chat.send_action(
+        ChatAction.TYPING
     )
-
-    text = text.strip()
-
-    if text.startswith("%"):
-
-        text = text[1:].strip()
-
-    return text
-
-
-# ============================================================
-# MAIN HANDLER
-# ============================================================
-
-@dp.message()
-async def messages(
-    message: Message
-):
-
-    if (
-        message.text
-        and message.text.startswith("/")
-    ):
-        return
-
-    if (
-        message.caption
-        and message.caption.startswith("/")
-    ):
-        return
-
-    if not should_answer(message):
-
-        return
-
-    media_dir = None
-
-    generated_dir = None
 
     try:
 
-        user_text = get_user_text(
-            message
+        answer = await gemini_text(
+            update.effective_chat.id,
+            prompt,
         )
 
-        # ====================================================
-        # VIDEO
-        # ====================================================
-
-        if (
-            user_text
-            and is_video_request(user_text)
-        ):
-
-            prompt = clean_video_prompt(
-                user_text
-            )
-
-            if not prompt:
-
-                await message.reply(
-                    "🎬 Напиши описание видео."
-                )
-
-                return
-
-            await message.reply(
-                "🎬 Генерирую видео...\n\n"
-                "⏳ Это может занять "
-                "некоторое время."
-            )
-
-            generated_dir, video_path = (
-                await generate_video(
-                    prompt
-                )
-            )
-
-            save_history(
-                message.chat.id,
-                user_text,
-                "[Видео сгенерировано]",
-            )
-
-            trim_history(
-                message.chat.id
-            )
-
-            await message.answer_video(
-                video=FSInputFile(
-                    video_path
-                ),
-                caption="🎬 Готово!",
-            )
-
-            return
-
-        # ====================================================
-        # IMAGE
-        # ====================================================
-
-        if (
-            user_text
-            and is_image_request(user_text)
-        ):
-
-            prompt = clean_image_prompt(
-                user_text
-            )
-
-            if not prompt:
-
-                await message.reply(
-                    "🖼 Напиши, что нарисовать."
-                )
-
-                return
-
-            await message.reply(
-                "🖼 Генерирую изображение..."
-            )
-
-            generated_dir, image_path = (
-                await generate_image(
-                    prompt
-                )
-            )
-
-            save_history(
-                message.chat.id,
-                user_text,
-                "[Изображение сгенерировано]",
-            )
-
-            trim_history(
-                message.chat.id
-            )
-
-            await message.answer_photo(
-                photo=FSInputFile(
-                    image_path
-                ),
-                caption="🖼 Готово!",
-            )
-
-            return
-
-        # ====================================================
-        # GEMINI
-        # ====================================================
-
-        (
-            media_dir,
-            media_path,
-            mime_type,
-        ) = await download_media(
-            message
+        await update.message.reply_text(
+            answer
         )
 
-        if not user_text:
+    except Exception as e:
 
-            user_text = (
-                "Проанализируй этот "
-                "медиафайл и ответь "
-                "пользователю."
-            )
+        logging.exception("GEMINI ERROR")
 
-        await bot.send_chat_action(
-            chat_id=message.chat.id,
-            action="typing",
+        await update.message.reply_text(
+            f"❌ Ошибка:\n\n{e}"
         )
-
-        answer = await ask_gemini(
-            chat_id=message.chat.id,
-            prompt=user_text,
-            media_path=media_path,
-            mime_type=mime_type,
-        )
-
-        save_history(
-            message.chat.id,
-            user_text,
-            answer,
-        )
-
-        trim_history(
-            message.chat.id
-        )
-
-        for i in range(
-            0,
-            len(answer),
-            4096,
-        ):
-
-            await message.reply(
-                answer[
-                    i:i + 4096
-                ]
-            )
-
-    except Exception as error:
-
-        print(
-            f"[ERROR] "
-            f"{message.chat.id}: "
-            f"{repr(error)}"
-        )
-
-        await message.reply(
-            "❌ Ошибка:\n\n"
-            f"<code>"
-            f"{esc(str(error)[:3000])}"
-            f"</code>",
-            parse_mode="HTML",
-        )
-
-    finally:
-
-        if media_dir:
-
-            shutil.rmtree(
-                media_dir,
-                ignore_errors=True,
-            )
-
-        if generated_dir:
-
-            shutil.rmtree(
-                generated_dir,
-                ignore_errors=True,
-            )
 
 
 # ============================================================
-# HTML
+# PHOTO MESSAGE
 # ============================================================
 
-def esc(
-    text: str
+async def photo_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
-    return html.escape(
-        str(text)
+    if not settings["reply_all"]:
+
+        caption = update.message.caption or ""
+
+        if not caption.startswith("%"):
+            return
+
+    caption = update.message.caption or ""
+
+    if caption.startswith("%"):
+        caption = caption[1:].strip()
+
+    if not caption:
+        caption = (
+            "Опиши подробно, что изображено "
+            "на этой фотографии."
+        )
+
+    await update.message.chat.send_action(
+        ChatAction.TYPING
+    )
+
+    try:
+
+        photo = update.message.photo[-1]
+
+        file = await context.bot.get_file(
+            photo.file_id
+        )
+
+        buffer = io.BytesIO()
+
+        await file.download_to_memory(
+            out=buffer
+        )
+
+        result = await gemini_media(
+            update.effective_chat.id,
+            caption,
+            buffer.getvalue(),
+            "image/jpeg",
+        )
+
+        await update.message.reply_text(
+            result
+        )
+
+    except Exception as e:
+
+        logging.exception("PHOTO ERROR")
+
+        await update.message.reply_text(
+            f"❌ Ошибка анализа фото:\n\n{e}"
+        )
+
+
+# ============================================================
+# AUDIO
+# ============================================================
+
+async def audio_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not settings["reply_all"]:
+
+        caption = update.message.caption or ""
+
+        if not caption.startswith("%"):
+            return
+
+    caption = update.message.caption or ""
+
+    if caption.startswith("%"):
+        caption = caption[1:].strip()
+
+    if not caption:
+        caption = "Проанализируй это аудио."
+
+    try:
+
+        if update.message.audio:
+
+            media = update.message.audio
+
+        elif update.message.voice:
+
+            media = update.message.voice
+
+        else:
+            return
+
+        file = await context.bot.get_file(
+            media.file_id
+        )
+
+        buffer = io.BytesIO()
+
+        await file.download_to_memory(
+            out=buffer
+        )
+
+        mime = (
+            media.mime_type
+            if getattr(media, "mime_type", None)
+            else "audio/ogg"
+        )
+
+        result = await gemini_media(
+            update.effective_chat.id,
+            caption,
+            buffer.getvalue(),
+            mime,
+        )
+
+        await update.message.reply_text(
+            result
+        )
+
+    except Exception as e:
+
+        logging.exception("AUDIO ERROR")
+
+        await update.message.reply_text(
+            f"❌ Ошибка анализа аудио:\n\n{e}"
+        )
+
+
+# ============================================================
+# VIDEO UNDERSTANDING
+# ============================================================
+
+async def video_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not settings["reply_all"]:
+
+        caption = update.message.caption or ""
+
+        if not caption.startswith("%"):
+            return
+
+    caption = update.message.caption or ""
+
+    if caption.startswith("%"):
+        caption = caption[1:].strip()
+
+    if not caption:
+        caption = "Проанализируй это видео."
+
+    try:
+
+        media = update.message.video
+
+        file = await context.bot.get_file(
+            media.file_id
+        )
+
+        buffer = io.BytesIO()
+
+        await file.download_to_memory(
+            out=buffer
+        )
+
+        result = await gemini_media(
+            update.effective_chat.id,
+            caption,
+            buffer.getvalue(),
+            media.mime_type or "video/mp4",
+        )
+
+        await update.message.reply_text(
+            result
+        )
+
+    except Exception as e:
+
+        logging.exception("VIDEO ANALYSIS ERROR")
+
+        await update.message.reply_text(
+            f"❌ Ошибка анализа видео:\n\n{e}"
+        )
+
+
+# ============================================================
+# START
+# ============================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.message.reply_text(
+        "🤖 AI Telegram Bot\n\n"
+        "Я умею:\n"
+        "• отвечать через Gemini\n"
+        "• анализировать фото\n"
+        "• анализировать аудио\n"
+        "• анализировать видео\n"
+        "• 🖼 генерировать изображения\n"
+        "• 🎬 генерировать видео\n\n"
+        "Команды:\n"
+        "/image <описание>\n"
+        "/video <описание>\n"
+        "/settings\n\n"
+        "В обычном режиме запрос начинается с `%`."
     )
 
 
 # ============================================================
-# RUN
+# ERROR HANDLER
 # ============================================================
 
-async def main():
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    print(
-        "================================"
+    logging.exception(
+        "Unhandled exception:",
+        exc_info=context.error
     )
 
-    print(
-        "Gemini Telegram Bot"
-    )
 
-    print(
-        f"Owner: {OWNER_ID}"
-    )
+# ============================================================
+# MAIN
+# ============================================================
 
-    print(
-        f"Text: "
-        f"{settings['text_model']}"
-    )
+def main():
 
-    print(
-        f"Image: "
-        f"{settings['image_model']}"
-    )
+    if not BOT_TOKEN:
 
-    print(
-        f"Video: "
-        f"{settings['video_model']}"
-    )
+        raise RuntimeError(
+            "Не установлена переменная BOT_TOKEN."
+        )
 
-    print(
-        f"Enabled: "
-        f"{settings['enabled']}"
-    )
-
-    print(
-        f"History: "
-        f"{settings['history_limit']}"
-    )
-
-    print(
-        "================================"
-    )
-
-    await dp.start_polling(
-        bot,
-        allowed_updates=(
-            dp.resolve_used_update_types()
+    logging.basicConfig(
+        format=(
+            "%(asctime)s - "
+            "%(name)s - "
+            "%(levelname)s - "
+            "%(message)s"
         ),
+        level=logging.INFO,
+    )
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # Commands
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "settings",
+            settings_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "cancel",
+            cancel_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "image",
+            image_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "video",
+            video_command
+        )
+    )
+
+    # Settings buttons
+    application.add_handler(
+        CallbackQueryHandler(
+            settings_callback
+        )
+    )
+
+    # Photo
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            photo_message
+        )
+    )
+
+    # Audio / voice
+    application.add_handler(
+        MessageHandler(
+            filters.AUDIO | filters.VOICE,
+            audio_message
+        )
+    )
+
+    # Video
+    application.add_handler(
+        MessageHandler(
+            filters.VIDEO,
+            video_message
+        )
+    )
+
+    # Text
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_message
+        )
+    )
+
+    application.add_error_handler(
+        error_handler
+    )
+
+    print("Bot started.")
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
     )
 
 
 if __name__ == "__main__":
-
-    asyncio.run(main())
+    main()
