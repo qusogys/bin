@@ -1,0 +1,7 @@
+aiogram
+openai
+pytesseract
+Pillow
+sqlalchemy
+python-dotenv
+requests
