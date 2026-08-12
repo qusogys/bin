@@ -5,6 +5,8 @@ import tempfile
 import html
 from pathlib import Path
 
+import aiohttp
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -37,8 +39,8 @@ DEFAULT_TEXT_MODEL = os.getenv(
 )
 
 DEFAULT_IMAGE_MODEL = os.getenv(
-    "GEMINI_IMAGE_MODEL",
-    "gemini-3.1-flash-image"
+    "IMAGE_MODEL",
+    "flux"
 )
 
 DEFAULT_VIDEO_MODEL = os.getenv(
@@ -62,9 +64,6 @@ DEFAULT_ENABLED = (
     in ("true", "1", "yes", "on")
 )
 
-# API ключи можно задать через Railway Variables.
-# Но владелец также может менять их через /settings.
-
 DEFAULT_GEMINI_KEY = os.getenv(
     "GEMINI_API_KEY",
     ""
@@ -72,6 +71,11 @@ DEFAULT_GEMINI_KEY = os.getenv(
 
 DEFAULT_HF_TOKEN = os.getenv(
     "HF_TOKEN",
+    ""
+)
+
+DEFAULT_POLLINATIONS_KEY = os.getenv(
+    "POLLINATIONS_API_KEY",
     ""
 )
 
@@ -90,6 +94,9 @@ settings = {
 
     "hf_token": DEFAULT_HF_TOKEN,
 
+    "pollinations_api_key":
+        DEFAULT_POLLINATIONS_KEY,
+
     "text_model": DEFAULT_TEXT_MODEL,
 
     "image_model": DEFAULT_IMAGE_MODEL,
@@ -105,7 +112,7 @@ settings = {
 
 
 # ============================================================
-# AVAILABLE MODELS
+# MODELS
 # ============================================================
 
 TEXT_MODELS = {
@@ -118,11 +125,20 @@ TEXT_MODELS = {
 
 
 IMAGE_MODELS = {
-    "gemini-3.1-flash-image":
-        "🖼 Gemini 3.1 Flash Image",
+    "flux":
+        "🎨 Flux",
 
-    "gemini-2.5-flash-image":
-        "🖼 Gemini 2.5 Flash Image",
+    "nanobanana-2":
+        "🍌 Nano Banana 2",
+
+    "gptimage":
+        "🖼 GPT Image",
+
+    "seedream5":
+        "✨ Seedream 5",
+
+    "zimage":
+        "⚡ Z-Image",
 }
 
 
@@ -157,6 +173,8 @@ class SettingsState(StatesGroup):
 
     waiting_hf_token = State()
 
+    waiting_pollinations_key = State()
+
     waiting_prompt = State()
 
     waiting_history = State()
@@ -166,11 +184,9 @@ class SettingsState(StatesGroup):
 # HISTORY
 # ============================================================
 
-# В памяти процесса.
+# БД НЕ используется.
 #
-# БД специально НЕ используется.
-#
-# После перезапуска Railway история исчезнет.
+# После перезапуска Railway история очищается.
 
 chat_histories = {}
 
@@ -217,12 +233,9 @@ def trim_history(chat_id: int):
     limit = settings["history_limit"]
 
     if limit == 0:
-
         return
 
     history = get_history(chat_id)
-
-    # 1 = ничего не помнить
 
     if limit == 1:
 
@@ -230,14 +243,11 @@ def trim_history(chat_id: int):
 
         return
 
-    # Храним примерно limit сообщений
     max_items = limit * 2
 
     if len(history) > max_items:
 
-        del history[
-            :-max_items
-        ]
+        del history[:-max_items]
 
 
 # ============================================================
@@ -267,6 +277,12 @@ def settings_keyboard():
         else "❌"
     )
 
+    pollinations_status = (
+        "✅"
+        if settings["pollinations_api_key"]
+        else "❌"
+    )
+
     mode = (
         "🟢 ВКЛ"
         if settings["enabled"]
@@ -275,10 +291,11 @@ def settings_keyboard():
 
     limit = settings["history_limit"]
 
-    if limit == 0:
-        history = "♾"
-    else:
-        history = str(limit)
+    history = (
+        "♾"
+        if limit == 0
+        else str(limit)
+    )
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -300,8 +317,16 @@ def settings_keyboard():
             [
                 InlineKeyboardButton(
                     text=(
-                        "🎭 Роль / промт"
+                        f"🖼 Image API: "
+                        f"{pollinations_status}"
                     ),
+                    callback_data="set_pollinations_key",
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🎭 Роль / промт",
                     callback_data="set_prompt",
                 )
             ],
@@ -385,6 +410,12 @@ def settings_text():
         else "❌ не установлен"
     )
 
+    image_status = (
+        "✅ установлен"
+        if settings["pollinations_api_key"]
+        else "❌ не установлен"
+    )
+
     if settings["enabled"]:
 
         mode = (
@@ -403,21 +434,17 @@ def settings_text():
     limit = settings["history_limit"]
 
     if limit == 0:
-
         history = "♾ без лимита"
 
     elif limit == 1:
-
         history = "1 — ничего не помнить"
 
     else:
-
         history = f"{limit} сообщений"
 
     prompt = settings["prompt"]
 
     if len(prompt) > 800:
-
         prompt = prompt[:800] + "..."
 
     return (
@@ -426,7 +453,8 @@ def settings_text():
         f"👑 Владелец: <code>{OWNER_ID}</code>\n\n"
 
         f"🔑 Gemini API: {gemini_status}\n"
-        f"🎬 Hugging Face API: {hf_status}\n\n"
+        f"🎬 Hugging Face API: {hf_status}\n"
+        f"🖼 Image API: {image_status}\n\n"
 
         "🤖 <b>Текст:</b>\n"
         f"<code>{esc(settings['text_model'])}</code>\n\n"
@@ -459,17 +487,19 @@ async def start(message: Message):
     await message.answer(
         "👋 <b>Gemini AI Bot</b>\n\n"
 
-        "Я умею:\n"
-        "💬 отвечать на сообщения\n"
-        "📷 анализировать фотографии\n"
-        "🎤 анализировать аудио\n"
-        "🎥 анализировать видео\n"
-        "🖼 генерировать изображения\n"
-        "🎬 генерировать видео\n"
-        "🧠 помнить историю\n\n"
+        "💬 Текст\n"
+        "📷 Анализ фото\n"
+        "🎤 Анализ аудио\n"
+        "🎥 Анализ видео\n"
+        "🖼 Генерация изображений\n"
+        "🎬 Генерация видео\n"
+        "🧠 История\n\n"
 
         "Пример:\n"
         "<code>%сколько будет 25 × 25?</code>\n\n"
+
+        "Картинка:\n"
+        "<code>%нарисуй кота в космосе</code>\n\n"
 
         "Видео:\n"
         "<code>%видео кот идёт по Алматы ночью</code>\n\n"
@@ -491,10 +521,13 @@ async def settings_command(
     state: FSMContext,
 ):
 
-    if not is_owner(message.from_user.id):
+    if not is_owner(
+        message.from_user.id
+    ):
 
         await message.answer(
-            "⛔ Настройки доступны только владельцу."
+            "⛔ Настройки доступны "
+            "только владельцу."
         )
 
         return
@@ -509,7 +542,7 @@ async def settings_command(
 
 
 # ============================================================
-# GEMINI API KEY
+# GEMINI KEY
 # ============================================================
 
 @dp.callback_query(
@@ -520,7 +553,9 @@ async def set_gemini_key(
     state: FSMContext,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -534,10 +569,8 @@ async def set_gemini_key(
     )
 
     await callback.message.answer(
-        "🔑 Отправь <b>Gemini API key</b>.\n\n"
-        "Для отмены: /cancel",
-
-        parse_mode="HTML",
+        "🔑 Отправь Gemini API key.\n\n"
+        "Для отмены: /cancel"
     )
 
     await callback.answer()
@@ -551,21 +584,17 @@ async def receive_gemini_key(
     state: FSMContext,
 ):
 
-    if not is_owner(message.from_user.id):
+    if not is_owner(
+        message.from_user.id
+    ):
 
         await state.clear()
 
         return
 
-    if not message.text:
-
-        await message.answer(
-            "❌ Отправь ключ текстом."
-        )
-
-        return
-
-    key = message.text.strip()
+    key = (
+        message.text or ""
+    ).strip()
 
     if len(key) < 10:
 
@@ -586,7 +615,7 @@ async def receive_gemini_key(
 
 
 # ============================================================
-# HUGGING FACE TOKEN
+# HF TOKEN
 # ============================================================
 
 @dp.callback_query(
@@ -597,7 +626,9 @@ async def set_hf_token(
     state: FSMContext,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -611,13 +642,10 @@ async def set_hf_token(
     )
 
     await callback.message.answer(
-        "🎬 Отправь <b>Hugging Face Token</b>.\n\n"
-
+        "🎬 Отправь Hugging Face Token.\n\n"
         "Нужен токен с разрешением "
         "<b>Inference Providers</b>.\n\n"
-
         "Для отмены: /cancel",
-
         parse_mode="HTML",
     )
 
@@ -632,29 +660,23 @@ async def receive_hf_token(
     state: FSMContext,
 ):
 
-    if not is_owner(message.from_user.id):
+    if not is_owner(
+        message.from_user.id
+    ):
 
         await state.clear()
 
         return
 
-    if not message.text:
-
-        await message.answer(
-            "❌ Отправь токен текстом."
-        )
-
-        return
-
-    token = message.text.strip()
+    token = (
+        message.text or ""
+    ).strip()
 
     if not token.startswith("hf_"):
 
         await message.answer(
-            "⚠️ Обычно Hugging Face token "
-            "начинается с <code>hf_</code>.\n\n"
-            "Отправь правильный токен.",
-            parse_mode="HTML",
+            "❌ Hugging Face Token "
+            "обычно начинается с hf_."
         )
 
         return
@@ -665,6 +687,91 @@ async def receive_hf_token(
 
     await message.answer(
         "✅ Hugging Face token сохранён.",
+        reply_markup=settings_keyboard(),
+    )
+
+
+# ============================================================
+# POLLINATIONS KEY
+# ============================================================
+
+@dp.callback_query(
+    F.data == "set_pollinations_key"
+)
+async def set_pollinations_key(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    if not is_owner(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "⛔ Нет доступа.",
+            show_alert=True,
+        )
+
+        return
+
+    await state.set_state(
+        SettingsState.waiting_pollinations_key
+    )
+
+    await callback.message.answer(
+        "🖼 Отправь Pollinations API key.\n\n"
+
+        "Для генерации через API нужен ключ.\n\n"
+
+        "Официальная страница ключей:\n"
+        "https://enter.pollinations.ai\n\n"
+
+        "Для отмены: /cancel",
+    )
+
+    await callback.answer()
+
+
+@dp.message(
+    SettingsState.waiting_pollinations_key
+)
+async def receive_pollinations_key(
+    message: Message,
+    state: FSMContext,
+):
+
+    if not is_owner(
+        message.from_user.id
+    ):
+
+        await state.clear()
+
+        return
+
+    key = (
+        message.text or ""
+    ).strip()
+
+    if not (
+        key.startswith("sk_")
+        or key.startswith("pk_")
+    ):
+
+        await message.answer(
+            "❌ Pollinations key должен "
+            "начинаться с sk_ или pk_."
+        )
+
+        return
+
+    settings[
+        "pollinations_api_key"
+    ] = key
+
+    await state.clear()
+
+    await message.answer(
+        "✅ Pollinations API key сохранён.",
         reply_markup=settings_keyboard(),
     )
 
@@ -681,7 +788,9 @@ async def set_prompt(
     state: FSMContext,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -696,15 +805,12 @@ async def set_prompt(
 
     await callback.message.answer(
         "🎭 Отправь новую роль / system prompt.\n\n"
-
         "Например:\n"
         "<code>"
         "Ты профессиональный программист. "
         "Отвечай кратко и по делу."
         "</code>\n\n"
-
         "Для отмены: /cancel",
-
         parse_mode="HTML",
     )
 
@@ -719,7 +825,9 @@ async def receive_prompt(
     state: FSMContext,
 ):
 
-    if not is_owner(message.from_user.id):
+    if not is_owner(
+        message.from_user.id
+    ):
 
         await state.clear()
 
@@ -733,7 +841,9 @@ async def receive_prompt(
 
         return
 
-    settings["prompt"] = message.text.strip()
+    settings["prompt"] = (
+        message.text.strip()
+    )
 
     await state.clear()
 
@@ -789,7 +899,9 @@ async def text_models(
     callback: CallbackQuery,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -817,7 +929,9 @@ async def choose_text_model(
     callback: CallbackQuery,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -896,7 +1010,9 @@ async def image_models(
     callback: CallbackQuery,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -924,7 +1040,9 @@ async def choose_image_model(
     callback: CallbackQuery,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -1003,7 +1121,9 @@ async def video_models(
     callback: CallbackQuery,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -1014,10 +1134,6 @@ async def video_models(
 
     await callback.message.edit_text(
         "🎬 <b>Модель видео</b>\n\n"
-
-        "Генерация выполняется через "
-        "Hugging Face Inference Providers.\n\n"
-
         "Выбери модель:",
 
         reply_markup=video_models_keyboard(),
@@ -1035,7 +1151,9 @@ async def choose_video_model(
     callback: CallbackQuery,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -1069,7 +1187,7 @@ async def choose_video_model(
 
 
 # ============================================================
-# TOGGLE MODE
+# TOGGLE
 # ============================================================
 
 @dp.callback_query(
@@ -1079,7 +1197,9 @@ async def toggle_mode(
     callback: CallbackQuery,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -1088,7 +1208,9 @@ async def toggle_mode(
 
         return
 
-    settings["enabled"] = not settings["enabled"]
+    settings["enabled"] = (
+        not settings["enabled"]
+    )
 
     await callback.message.edit_text(
         settings_text(),
@@ -1102,7 +1224,7 @@ async def toggle_mode(
 
 
 # ============================================================
-# HISTORY LIMIT
+# HISTORY
 # ============================================================
 
 @dp.callback_query(
@@ -1113,7 +1235,9 @@ async def history_limit(
     state: FSMContext,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -1129,12 +1253,10 @@ async def history_limit(
     await callback.message.answer(
         "🧠 <b>Лимит истории</b>\n\n"
 
-        "Отправь число:\n\n"
-
         "0 — без лимита\n"
         "1 — ничего не помнить\n"
-        "5 — помнить примерно 5 сообщений\n"
-        "20 — помнить примерно 20 сообщений\n\n"
+        "5 — примерно 5 сообщений\n"
+        "20 — примерно 20 сообщений\n\n"
 
         "Для отмены: /cancel",
 
@@ -1152,7 +1274,9 @@ async def receive_history_limit(
     state: FSMContext,
 ):
 
-    if not is_owner(message.from_user.id):
+    if not is_owner(
+        message.from_user.id
+    ):
 
         await state.clear()
 
@@ -1175,7 +1299,8 @@ async def receive_history_limit(
     if value < 0:
 
         await message.answer(
-            "❌ Значение не может быть меньше 0."
+            "❌ Значение не может быть "
+            "меньше 0."
         )
 
         return
@@ -1185,8 +1310,11 @@ async def receive_history_limit(
     await state.clear()
 
     await message.answer(
-        f"✅ Лимит истории: <b>{value}</b>",
+        f"✅ Лимит истории: "
+        f"<b>{value}</b>",
+
         reply_markup=settings_keyboard(),
+
         parse_mode="HTML",
     )
 
@@ -1202,7 +1330,9 @@ async def clear_history_callback(
     callback: CallbackQuery,
 ):
 
-    if not is_owner(callback.from_user.id):
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -1210,9 +1340,6 @@ async def clear_history_callback(
         )
 
         return
-
-    # Владелец очищает историю
-    # текущего чата.
 
     clear_history(
         callback.message.chat.id
@@ -1225,7 +1352,7 @@ async def clear_history_callback(
 
 
 # ============================================================
-# REFRESH
+# REFRESH / BACK
 # ============================================================
 
 @dp.callback_query(
@@ -1235,13 +1362,13 @@ async def refresh_settings(
     callback: CallbackQuery,
 ):
 
-    if not is_owner(callback.from_user.id):
-
+    if not is_owner(
+        callback.from_user.id
+    ):
         await callback.answer(
             "⛔ Нет доступа.",
             show_alert=True,
         )
-
         return
 
     await callback.message.edit_text(
@@ -1253,10 +1380,6 @@ async def refresh_settings(
     await callback.answer()
 
 
-# ============================================================
-# BACK
-# ============================================================
-
 @dp.callback_query(
     F.data == "back_settings"
 )
@@ -1264,13 +1387,13 @@ async def back_settings(
     callback: CallbackQuery,
 ):
 
-    if not is_owner(callback.from_user.id):
-
+    if not is_owner(
+        callback.from_user.id
+    ):
         await callback.answer(
             "⛔ Нет доступа.",
             show_alert=True,
         )
-
         return
 
     await callback.message.edit_text(
@@ -1292,8 +1415,9 @@ async def cancel(
     state: FSMContext,
 ):
 
-    if not is_owner(message.from_user.id):
-
+    if not is_owner(
+        message.from_user.id
+    ):
         return
 
     await state.clear()
@@ -1304,7 +1428,7 @@ async def cancel(
 
 
 # ============================================================
-# DOWNLOAD TELEGRAM MEDIA
+# TELEGRAM MEDIA DOWNLOAD
 # ============================================================
 
 async def download_media(
@@ -1316,8 +1440,6 @@ async def download_media(
             prefix="tg_gemini_"
         )
     )
-
-    # PHOTO
 
     if message.photo:
 
@@ -1338,8 +1460,6 @@ async def download_media(
             "image/jpeg",
         )
 
-    # VOICE
-
     if message.voice:
 
         file = await bot.get_file(
@@ -1358,8 +1478,6 @@ async def download_media(
             path,
             "audio/ogg",
         )
-
-    # AUDIO
 
     if message.audio:
 
@@ -1386,8 +1504,6 @@ async def download_media(
             or "audio/mpeg",
         )
 
-    # VIDEO
-
     if message.video:
 
         file = await bot.get_file(
@@ -1408,8 +1524,6 @@ async def download_media(
             or "video/mp4",
         )
 
-    # VIDEO NOTE
-
     if message.video_note:
 
         file = await bot.get_file(
@@ -1428,8 +1542,6 @@ async def download_media(
             path,
             "video/mp4",
         )
-
-    # DOCUMENT
 
     if message.document:
 
@@ -1465,7 +1577,7 @@ async def download_media(
 
 
 # ============================================================
-# GEMINI REQUEST
+# GEMINI
 # ============================================================
 
 async def ask_gemini(
@@ -1478,8 +1590,8 @@ async def ask_gemini(
     if not settings["gemini_api_key"]:
 
         raise RuntimeError(
-            "Gemini API key не установлен.\n\n"
-            "Открой /settings → Gemini API."
+            "Gemini API key не установлен.\n"
+            "Открой /settings."
         )
 
     client = genai.Client(
@@ -1524,10 +1636,6 @@ async def ask_gemini(
             text=prompt
         )
     ]
-
-    # --------------------------------------------------------
-    # MEDIA
-    # --------------------------------------------------------
 
     if media_path:
 
@@ -1586,7 +1694,7 @@ async def ask_gemini(
 
 
 # ============================================================
-# IMAGE GENERATION
+# IMAGE REQUEST
 # ============================================================
 
 def is_image_request(
@@ -1654,125 +1762,144 @@ def clean_image_prompt(
     return text
 
 
+# ============================================================
+# POLLINATIONS IMAGE
+# ============================================================
+
 async def generate_image(
     prompt: str
 ):
 
-    if not settings["gemini_api_key"]:
+    api_key = settings[
+        "pollinations_api_key"
+    ]
+
+    if not api_key:
 
         raise RuntimeError(
-            "Gemini API key не установлен."
-        )
-
-    client = genai.Client(
-        api_key=settings["gemini_api_key"]
-    )
-
-    response = await asyncio.to_thread(
-        client.models.generate_content,
-
-        model=settings["image_model"],
-
-        contents=[prompt],
-
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"]
-        ),
-    )
-
-    for part in response.parts:
-
-        if part.inline_data:
-
-            image = part.as_image()
-
-            temp_dir = Path(
-                tempfile.mkdtemp(
-                    prefix="generated_"
-                )
-            )
-
-            path = (
-                temp_dir / "image.png"
-            )
-
-            image.save(path)
-
-            return temp_dir, path
-
-    raise RuntimeError(
-        "Image-модель не вернула изображение."
-    )
-
-
-# ============================================================
-# VIDEO GENERATION
-# ============================================================
-
-async def generate_video(
-    prompt: str
-):
-
-    if not settings["hf_token"]:
-
-        raise RuntimeError(
-            "Hugging Face token не установлен.\n\n"
+            "Pollinations API key "
+            "не установлен.\n\n"
             "Открой /settings → "
-            "Hugging Face API."
+            "🖼 Image API."
         )
 
-    # HF официально показывает этот способ
-    # для text-to-video через Inference Providers.
+    model = settings[
+        "image_model"
+    ]
 
-    client = InferenceClient(
-        provider="fal-ai",
-        api_key=settings["hf_token"],
+    encoded_prompt = (
+        prompt
     )
 
-    video_bytes = await asyncio.to_thread(
-        lambda: client.text_to_video(
-            prompt,
-            model=settings["video_model"],
+    url = (
+        "https://gen.pollinations.ai/image/"
+        + aiohttp.helpers.quote(
+            encoded_prompt,
+            safe=""
         )
     )
 
-    if not video_bytes:
+    params = {
+        "model": model,
 
-        raise RuntimeError(
-            "Video API не вернуло видео."
-        )
+        "width": "1024",
+
+        "height": "1024",
+
+        "nologo": "true",
+    }
+
+    headers = {
+        "Authorization":
+            f"Bearer {api_key}",
+    }
+
+    timeout = aiohttp.ClientTimeout(
+        total=300
+    )
 
     temp_dir = Path(
         tempfile.mkdtemp(
-            prefix="generated_video_"
+            prefix="generated_image_"
         )
     )
 
-    video_path = (
-        temp_dir / "video.mp4"
+    image_path = (
+        temp_dir / "image.jpg"
     )
 
-    if hasattr(
-        video_bytes,
-        "read"
-    ):
+    try:
 
-        data = video_bytes.read()
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
 
-    else:
+            async with session.get(
+                url,
+                params=params,
+                headers=headers,
+            ) as response:
 
-        data = bytes(video_bytes)
+                data = await response.read()
 
-    video_path.write_bytes(data)
+                if response.status != 200:
 
-    return (
-        temp_dir,
-        video_path,
-    )
+                    error_text = (
+                        data.decode(
+                            "utf-8",
+                            errors="ignore"
+                        )
+                    )
+
+                    raise RuntimeError(
+                        f"Pollinations HTTP "
+                        f"{response.status}: "
+                        f"{error_text[:2000]}"
+                    )
+
+                content_type = (
+                    response.headers.get(
+                        "Content-Type",
+                        ""
+                    )
+                )
+
+                if not content_type.startswith(
+                    "image/"
+                ):
+
+                    text = data.decode(
+                        "utf-8",
+                        errors="ignore"
+                    )
+
+                    raise RuntimeError(
+                        "Pollinations вернул "
+                        "не изображение:\n"
+                        + text[:2000]
+                    )
+
+                image_path.write_bytes(
+                    data
+                )
+
+        return (
+            temp_dir,
+            image_path,
+        )
+
+    except Exception:
+
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+
+        raise
 
 
 # ============================================================
-# VIDEO COMMAND DETECTION
+# VIDEO
 # ============================================================
 
 def is_video_request(
@@ -1826,6 +1953,69 @@ def clean_video_prompt(
     return text
 
 
+async def generate_video(
+    prompt: str
+):
+
+    if not settings["hf_token"]:
+
+        raise RuntimeError(
+            "Hugging Face token "
+            "не установлен."
+        )
+
+    # ВИДЕО НЕ МЕНЯЕМ.
+    # Оставляем текущую реализацию.
+
+    client = InferenceClient(
+        provider="fal-ai",
+        api_key=settings["hf_token"],
+    )
+
+    video_bytes = await asyncio.to_thread(
+        lambda: client.text_to_video(
+            prompt,
+            model=settings["video_model"],
+        )
+    )
+
+    if not video_bytes:
+
+        raise RuntimeError(
+            "Video API не вернуло видео."
+        )
+
+    temp_dir = Path(
+        tempfile.mkdtemp(
+            prefix="generated_video_"
+        )
+    )
+
+    video_path = (
+        temp_dir / "video.mp4"
+    )
+
+    if hasattr(
+        video_bytes,
+        "read"
+    ):
+
+        data = video_bytes.read()
+
+    else:
+
+        data = bytes(video_bytes)
+
+    video_path.write_bytes(
+        data
+    )
+
+    return (
+        temp_dir,
+        video_path,
+    )
+
+
 # ============================================================
 # SHOULD ANSWER
 # ============================================================
@@ -1847,10 +2037,6 @@ def should_answer(
     return text.startswith("%")
 
 
-# ============================================================
-# USER TEXT
-# ============================================================
-
 def get_user_text(
     message: Message
 ):
@@ -1871,7 +2057,7 @@ def get_user_text(
 
 
 # ============================================================
-# MAIN MESSAGE HANDLER
+# MAIN HANDLER
 # ============================================================
 
 @dp.message()
@@ -1879,20 +2065,16 @@ async def messages(
     message: Message
 ):
 
-    # Не обрабатываем команды.
-
     if (
         message.text
         and message.text.startswith("/")
     ):
-
         return
 
     if (
         message.caption
         and message.caption.startswith("/")
     ):
-
         return
 
     if not should_answer(message):
@@ -1925,20 +2107,15 @@ async def messages(
             if not prompt:
 
                 await message.reply(
-                    "🎬 Напиши описание видео.\n\n"
-
-                    "<code>"
-                    "%видео кот идёт по ночному Алматы"
-                    "</code>",
-
-                    parse_mode="HTML",
+                    "🎬 Напиши описание видео."
                 )
 
                 return
 
             await message.reply(
                 "🎬 Генерирую видео...\n\n"
-                "⏳ Это может занять некоторое время."
+                "⏳ Это может занять "
+                "некоторое время."
             )
 
             generated_dir, video_path = (
@@ -1949,10 +2126,8 @@ async def messages(
 
             save_history(
                 message.chat.id,
-
                 user_text,
-
-                "[Видео сгенерировано]"
+                "[Видео сгенерировано]",
             )
 
             trim_history(
@@ -1963,8 +2138,7 @@ async def messages(
                 video=FSInputFile(
                     video_path
                 ),
-
-                caption="🎬 Готово!"
+                caption="🎬 Готово!",
             )
 
             return
@@ -2002,10 +2176,8 @@ async def messages(
 
             save_history(
                 message.chat.id,
-
                 user_text,
-
-                "[Изображение сгенерировано]"
+                "[Изображение сгенерировано]",
             )
 
             trim_history(
@@ -2016,14 +2188,13 @@ async def messages(
                 photo=FSInputFile(
                     image_path
                 ),
-
-                caption="🖼 Готово!"
+                caption="🖼 Готово!",
             )
 
             return
 
         # ====================================================
-        # NORMAL GEMINI
+        # GEMINI
         # ====================================================
 
         (
@@ -2038,7 +2209,8 @@ async def messages(
 
             user_text = (
                 "Проанализируй этот "
-                "медиафайл и ответь пользователю."
+                "медиафайл и ответь "
+                "пользователю."
             )
 
         await bot.send_chat_action(
@@ -2048,28 +2220,20 @@ async def messages(
 
         answer = await ask_gemini(
             chat_id=message.chat.id,
-
             prompt=user_text,
-
             media_path=media_path,
-
             mime_type=mime_type,
         )
 
         save_history(
             message.chat.id,
-
             user_text,
-
             answer,
         )
 
         trim_history(
             message.chat.id
         )
-
-        # Telegram ограничивает одно
-        # текстовое сообщение 4096 символами.
 
         for i in range(
             0,
@@ -2093,8 +2257,9 @@ async def messages(
 
         await message.reply(
             "❌ Ошибка:\n\n"
-            f"<code>{esc(str(error)[:3000])}</code>",
-
+            f"<code>"
+            f"{esc(str(error)[:3000])}"
+            f"</code>",
             parse_mode="HTML",
         )
 
@@ -2129,13 +2294,13 @@ def esc(
 
 
 # ============================================================
-# MAIN
+# RUN
 # ============================================================
 
 async def main():
 
     print(
-        "======================================"
+        "================================"
     )
 
     print(
@@ -2172,12 +2337,11 @@ async def main():
     )
 
     print(
-        "======================================"
+        "================================"
     )
 
     await dp.start_polling(
         bot,
-
         allowed_updates=(
             dp.resolve_used_update_types()
         ),
