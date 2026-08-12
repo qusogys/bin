@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -29,29 +30,103 @@ from telegram.ext import (
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-
 OWNER_ID = 8904429775
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
 
-GEMINI_MODEL = "gemini-3.6-flash"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+MODELS_FILE = DATA_DIR / "models.json"
 
-SYSTEM_PROMPT = (
+DEFAULT_SYSTEM_PROMPT = (
     "Ты полезный AI-ассистент Telegram-бота. "
     "Отвечай на русском языке, если пользователь "
     "не просит другой язык. "
     "Отвечай понятно, точно и по делу."
 )
 
-# 1 = память выключена
-# 10 = последние 10 сообщений
-# 20 = последние 20 сообщений
-# 0 = без ограничения
-HISTORY_LIMIT = 20
 
-# True — отвечает на любой текст
-# False — только на текст, начинающийся с %
-REPLY_ALL = True
+# ============================================================
+# DEFAULT DATA
+# ============================================================
+
+DEFAULT_SETTINGS = {
+    "gemini_api_key": "",
+    "current_model": "",
+    "history_limit": 20,
+    "reply_all": True,
+    "system_prompt": DEFAULT_SYSTEM_PROMPT,
+}
+
+DEFAULT_MODELS = [
+    "gemini-3.6-flash",
+]
+
+
+# ============================================================
+# JSON
+# ============================================================
+
+def load_json(path, default):
+
+    if not path.exists():
+        save_json(path, default)
+        return default.copy() if isinstance(default, dict) else list(default)
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default.copy() if isinstance(default, dict) else list(default)
+
+
+def save_json(path, data):
+
+    temp = path.with_suffix(".tmp")
+
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    temp.replace(path)
+
+
+settings = load_json(
+    SETTINGS_FILE,
+    DEFAULT_SETTINGS,
+)
+
+models = load_json(
+    MODELS_FILE,
+    DEFAULT_MODELS,
+)
+
+
+# ============================================================
+# NORMALIZE
+# ============================================================
+
+if not isinstance(models, list):
+    models = DEFAULT_MODELS.copy()
+
+models = list(dict.fromkeys(
+    str(x).strip()
+    for x in models
+    if str(x).strip()
+))
+
+if not models:
+    models = DEFAULT_MODELS.copy()
+
+if not settings.get("current_model"):
+    settings["current_model"] = models[0]
+
+save_json(MODELS_FILE, models)
+save_json(SETTINGS_FILE, settings)
 
 
 # ============================================================
@@ -62,10 +137,18 @@ histories = defaultdict(deque)
 
 
 def add_history(chat_id, role, text):
-    if HISTORY_LIMIT == 1:
+
+    limit = int(
+        settings.get(
+            "history_limit",
+            20,
+        )
+    )
+
+    if limit == 1:
         return
 
-    if HISTORY_LIMIT == 0:
+    if limit == 0:
         histories[chat_id].append({
             "role": role,
             "text": text,
@@ -74,7 +157,7 @@ def add_history(chat_id, role, text):
 
     histories[chat_id] = deque(
         histories[chat_id],
-        maxlen=HISTORY_LIMIT,
+        maxlen=limit,
     )
 
     histories[chat_id].append({
@@ -83,23 +166,15 @@ def add_history(chat_id, role, text):
     })
 
 
-def get_history(chat_id):
-    return list(histories[chat_id])
-
-
-def clear_history(chat_id):
-    histories.pop(chat_id, None)
-
-
 def history_text(chat_id):
-    history = get_history(chat_id)
 
-    if not history:
+    if not histories[chat_id]:
         return ""
 
     result = []
 
-    for item in history:
+    for item in histories[chat_id]:
+
         role = (
             "Пользователь"
             if item["role"] == "user"
@@ -117,44 +192,88 @@ def history_text(chat_id):
 # GEMINI
 # ============================================================
 
-def get_client():
-    if not GEMINI_API_KEY:
+def get_api_key():
+
+    key = settings.get(
+        "gemini_api_key",
+        "",
+    )
+
+    if not key:
+
         raise RuntimeError(
             "Gemini API ключ не установлен.\n"
             "Открой /settings → 🔑 Gemini API."
         )
 
+    return key
+
+
+def get_client():
+
     return genai.Client(
-        api_key=GEMINI_API_KEY
+        api_key=get_api_key()
     )
 
 
-async def ask_text(chat_id, prompt):
+def get_current_model():
+
+    model = settings.get(
+        "current_model",
+        "",
+    )
+
+    if not model:
+        raise RuntimeError(
+            "Модель не выбрана."
+        )
+
+    return model
+
+
+# ============================================================
+# TEXT
+# ============================================================
+
+async def ask_text(
+    chat_id,
+    prompt,
+):
 
     client = get_client()
 
-    old_history = history_text(chat_id)
+    old_history = history_text(
+        chat_id
+    )
 
     if old_history:
+
         contents = (
             "История диалога:\n\n"
             f"{old_history}\n\n"
             "Новое сообщение:\n"
             f"{prompt}"
         )
+
     else:
+
         contents = prompt
 
     response = await asyncio.to_thread(
         client.models.generate_content,
-        model=GEMINI_MODEL,
+        model=get_current_model(),
         contents=contents,
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=settings.get(
+                "system_prompt",
+                DEFAULT_SYSTEM_PROMPT,
+            ),
         ),
     )
 
-    answer = response.text or "Gemini не вернул ответ."
+    answer = response.text or (
+        "Модель не вернула текст."
+    )
 
     add_history(
         chat_id,
@@ -172,7 +291,7 @@ async def ask_text(chat_id, prompt):
 
 
 # ============================================================
-# GEMINI FILES
+# FILE ANALYSIS
 # ============================================================
 
 async def analyze_file(
@@ -188,14 +307,10 @@ async def analyze_file(
         file=local_path,
     )
 
-    # --------------------------------------------------------
-    # VIDEO
-    # --------------------------------------------------------
-
     if wait_for_video:
 
         waited = 0
-        max_wait = 600
+        timeout = 600
 
         while True:
 
@@ -215,11 +330,13 @@ async def analyze_file(
                 break
 
             if state_name == "FAILED":
+
                 raise RuntimeError(
                     "Gemini не смог обработать видео."
                 )
 
-            if waited >= max_wait:
+            if waited >= timeout:
+
                 raise TimeoutError(
                     "Gemini слишком долго "
                     "обрабатывает видео."
@@ -234,29 +351,32 @@ async def analyze_file(
                 name=uploaded.name,
             )
 
-    # --------------------------------------------------------
-    # ANALYZE
-    # --------------------------------------------------------
-
     response = await asyncio.to_thread(
         client.models.generate_content,
-        model=GEMINI_MODEL,
+        model=get_current_model(),
         contents=[
             uploaded,
             prompt,
         ],
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=settings.get(
+                "system_prompt",
+                DEFAULT_SYSTEM_PROMPT,
+            ),
         ),
     )
 
-    answer = response.text or "Gemini не вернул ответ."
+    answer = response.text or (
+        "Модель не вернула ответ."
+    )
 
     try:
+
         await asyncio.to_thread(
             client.files.delete,
             name=uploaded.name,
         )
+
     except Exception:
         pass
 
@@ -264,7 +384,7 @@ async def analyze_file(
 
 
 # ============================================================
-# SETTINGS UI
+# SETTINGS MAIN
 # ============================================================
 
 def settings_keyboard():
@@ -273,23 +393,25 @@ def settings_keyboard():
 
         [
             InlineKeyboardButton(
-                "🤖 Модель",
-                callback_data="set_model",
+                "🤖 Модели",
+                callback_data="models_menu",
             ),
+
             InlineKeyboardButton(
                 "🧠 Память",
-                callback_data="set_memory",
+                callback_data="memory_menu",
             ),
         ],
 
         [
             InlineKeyboardButton(
                 "💬 Режим",
-                callback_data="set_mode",
+                callback_data="mode_menu",
             ),
+
             InlineKeyboardButton(
                 "📝 System Prompt",
-                callback_data="set_system",
+                callback_data="system_menu",
             ),
         ],
 
@@ -297,13 +419,6 @@ def settings_keyboard():
             InlineKeyboardButton(
                 "🔑 Gemini API",
                 callback_data="api_menu",
-            ),
-        ],
-
-        [
-            InlineKeyboardButton(
-                "🔄 Проверить API",
-                callback_data="check_api",
             ),
         ],
 
@@ -317,7 +432,7 @@ def settings_keyboard():
         [
             InlineKeyboardButton(
                 "❌ Закрыть",
-                callback_data="close_settings",
+                callback_data="close",
             ),
         ],
     ])
@@ -325,70 +440,216 @@ def settings_keyboard():
 
 def settings_text():
 
-    api_status = (
+    api = (
         "✅ установлен"
-        if GEMINI_API_KEY
+        if settings.get("gemini_api_key")
         else "❌ не установлен"
     )
 
-    mode = (
-        "Все сообщения"
-        if REPLY_ALL
-        else "Только %"
+    model = settings.get(
+        "current_model",
+        "не выбрана",
     )
 
-    if HISTORY_LIMIT == 0:
-        memory = "Без ограничения"
-    elif HISTORY_LIMIT == 1:
-        memory = "Выключена"
+    limit = settings.get(
+        "history_limit",
+        20,
+    )
+
+    if limit == 0:
+        memory = "♾️ без ограничения"
+    elif limit == 1:
+        memory = "🚫 выключена"
     else:
-        memory = f"{HISTORY_LIMIT} сообщений"
+        memory = f"{limit} сообщений"
+
+    mode = (
+        "💬 все сообщения"
+        if settings.get("reply_all", True)
+        else "🔤 только %"
+    )
 
     return (
-        "⚙️ <b>Настройки бота</b>\n\n"
-        f"🤖 Модель: <code>{GEMINI_MODEL}</code>\n"
+        "⚙️ <b>Настройки</b>\n\n"
+        f"🤖 Модель: <code>{model}</code>\n"
         f"🧠 Память: {memory}\n"
         f"💬 Режим: {mode}\n"
-        f"🔑 Gemini API: {api_status}\n"
+        f"🔑 Gemini API: {api}\n\n"
+        f"📦 Сохранено моделей: {len(models)}"
     )
 
 
 # ============================================================
-# /START
+# MODELS MENU
 # ============================================================
 
-async def start_command(update, context):
+def models_keyboard():
 
-    await update.message.reply_text(
-        "🤖 <b>Gemini AI бот</b>\n\n"
-        "Я умею:\n"
-        "📝 понимать текст\n"
-        "🖼 анализировать фото\n"
-        "🎬 анализировать видео\n"
-        "🎵 анализировать аудио\n"
-        "📄 анализировать документы\n\n"
-        "Открой /settings для настройки.",
-        parse_mode="HTML",
+    rows = []
+
+    current = settings.get(
+        "current_model",
+        "",
     )
 
+    for index, model in enumerate(models):
 
-# ============================================================
-# /SETTINGS
-# ============================================================
-
-async def settings_command(update, context):
-
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text(
-            "❌ Нет доступа."
+        prefix = (
+            "✅ "
+            if model == current
+            else "○ "
         )
-        return
 
-    await update.message.reply_text(
-        settings_text(),
-        parse_mode="HTML",
-        reply_markup=settings_keyboard(),
+        rows.append([
+            InlineKeyboardButton(
+                prefix + model,
+                callback_data=f"model:{index}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "➕ Добавить свою модель",
+            callback_data="model_add",
+        )
+    ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "🔄 Загрузить модели Gemini",
+            callback_data="model_sync",
+        )
+    ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "🗑 Управление моделями",
+            callback_data="model_manage",
+        )
+    ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "◀️ Назад",
+            callback_data="settings",
+        )
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_models_menu(query):
+
+    current = settings.get(
+        "current_model",
+        "",
     )
+
+    await query.edit_message_text(
+        "🤖 <b>Мои модели</b>\n\n"
+        f"Текущая:\n"
+        f"<code>{current}</code>\n\n"
+        "Нажми на модель, чтобы выбрать её.",
+        parse_mode="HTML",
+        reply_markup=models_keyboard(),
+    )
+
+
+# ============================================================
+# ADD MODEL
+# ============================================================
+
+async def start_add_model(
+    query,
+    context,
+):
+
+    context.user_data["waiting"] = (
+        "model_add"
+    )
+
+    await query.edit_message_text(
+        "➕ <b>Добавление модели</b>\n\n"
+        "Отправь ID модели.\n\n"
+        "Например:\n"
+        "<code>gemini-3.6-flash</code>\n\n"
+        "После добавления модель появится "
+        "в меню выбора.\n\n"
+        "/cancel",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# MODEL MANAGEMENT
+# ============================================================
+
+def model_management_keyboard():
+
+    rows = []
+
+    for index, model in enumerate(models):
+
+        rows.append([
+            InlineKeyboardButton(
+                f"🗑 {model}",
+                callback_data=f"delete_model:{index}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(
+            "◀️ Назад",
+            callback_data="models_menu",
+        )
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+# ============================================================
+# SYNC GEMINI MODELS
+# ============================================================
+
+async def sync_gemini_models():
+
+    client = get_client()
+
+    found = []
+
+    pager = await asyncio.to_thread(
+        client.models.list
+    )
+
+    for model in pager:
+
+        supported = getattr(
+            model,
+            "supported_actions",
+            None,
+        )
+
+        if not supported:
+            continue
+
+        if "generateContent" not in supported:
+            continue
+
+        name = getattr(
+            model,
+            "name",
+            "",
+        )
+
+        if name.startswith("models/"):
+            name = name[
+                len("models/"):
+            ]
+
+        if name:
+            found.append(name)
+
+    return found
 
 
 # ============================================================
@@ -403,431 +664,272 @@ def api_keyboard():
             InlineKeyboardButton(
                 "➕ Изменить ключ",
                 callback_data="api_change",
-            ),
+            )
         ],
 
         [
             InlineKeyboardButton(
-                "🔍 Проверить ключ",
-                callback_data="check_api",
-            ),
+                "🔍 Проверить API",
+                callback_data="api_check",
+            )
         ],
 
         [
             InlineKeyboardButton(
                 "🗑 Удалить ключ",
                 callback_data="api_delete",
-            ),
+            )
         ],
 
         [
             InlineKeyboardButton(
                 "◀️ Назад",
-                callback_data="settings_main",
-            ),
+                callback_data="settings",
+            )
         ],
     ])
 
 
-async def show_api_menu(query):
-
-    status = (
-        "✅ установлен"
-        if GEMINI_API_KEY
-        else "❌ отсутствует"
-    )
-
-    await query.edit_message_text(
-        "🔑 <b>Gemini API</b>\n\n"
-        f"Статус: {status}\n\n"
-        "Ключ хранится только в памяти "
-        "запущенного бота.",
-        parse_mode="HTML",
-        reply_markup=api_keyboard(),
-    )
-
-
 # ============================================================
-# CALLBACKS
+# CALLBACK
 # ============================================================
 
-async def callback_handler(update, context):
-
-    global GEMINI_MODEL
-    global HISTORY_LIMIT
-    global REPLY_ALL
-    global SYSTEM_PROMPT
-    global GEMINI_API_KEY
+async def callback_handler(
+    update,
+    context,
+):
 
     query = update.callback_query
 
     await query.answer()
 
     if query.from_user.id != OWNER_ID:
+
         await query.edit_message_text(
             "❌ Нет доступа."
         )
+
         return
 
     data = query.data
 
     # --------------------------------------------------------
-    # MAIN SETTINGS
+    # SETTINGS
     # --------------------------------------------------------
 
-    if data == "settings_main":
+    if data == "settings":
 
         await query.edit_message_text(
             settings_text(),
             parse_mode="HTML",
             reply_markup=settings_keyboard(),
         )
+
         return
 
     # --------------------------------------------------------
-    # MODEL
+    # CLOSE
     # --------------------------------------------------------
 
-    if data == "set_model":
-
-        keyboard = InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "⚡ Gemini Flash",
-                    callback_data="model_flash",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "🧠 Gemini Pro",
-                    callback_data="model_pro",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "◀️ Назад",
-                    callback_data="settings_main",
-                ),
-            ],
-        ])
+    if data == "close":
 
         await query.edit_message_text(
-            "🤖 <b>Выбор модели</b>\n\n"
-            f"Сейчас: <code>{GEMINI_MODEL}</code>",
-            parse_mode="HTML",
-            reply_markup=keyboard,
+            "✅ Настройки закрыты."
         )
-        return
 
-    if data == "model_flash":
-
-        GEMINI_MODEL = "gemini-3.6-flash"
-
-        await query.edit_message_text(
-            "✅ Выбрана Flash-модель.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "◀️ Назад",
-                        callback_data="settings_main",
-                    )
-                ]
-            ]),
-        )
-        return
-
-    if data == "model_pro":
-
-        GEMINI_MODEL = "gemini-3.6-pro"
-
-        await query.edit_message_text(
-            "✅ Выбрана Pro-модель.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "◀️ Назад",
-                        callback_data="settings_main",
-                    )
-                ]
-            ]),
-        )
         return
 
     # --------------------------------------------------------
-    # MEMORY
+    # MODELS
     # --------------------------------------------------------
 
-    if data == "set_memory":
+    if data == "models_menu":
 
-        keyboard = InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "🚫 Выкл",
-                    callback_data="memory_1",
-                ),
-                InlineKeyboardButton(
-                    "5",
-                    callback_data="memory_5",
-                ),
-                InlineKeyboardButton(
-                    "10",
-                    callback_data="memory_10",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "20",
-                    callback_data="memory_20",
-                ),
-                InlineKeyboardButton(
-                    "50",
-                    callback_data="memory_50",
-                ),
-                InlineKeyboardButton(
-                    "♾️",
-                    callback_data="memory_0",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "🗑 Очистить",
-                    callback_data="clear_memory",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "◀️ Назад",
-                    callback_data="settings_main",
-                ),
-            ],
-        ])
-
-        await query.edit_message_text(
-            "🧠 <b>Память</b>\n\n"
-            "Выбери размер памяти диалога.",
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-        return
-
-    if data.startswith("memory_"):
-
-        value = int(
-            data.split("_")[1]
+        await show_models_menu(
+            query
         )
 
-        HISTORY_LIMIT = value
-
-        if value == 1:
-            histories.clear()
-
-        await query.edit_message_text(
-            f"✅ Память изменена: "
-            f"{'выключена' if value == 1 else 'без ограничения' if value == 0 else str(value) + ' сообщений'}",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "◀️ Назад",
-                        callback_data="settings_main",
-                    )
-                ]
-            ]),
-        )
         return
 
     # --------------------------------------------------------
-    # MODE
+    # SELECT MODEL
     # --------------------------------------------------------
 
-    if data == "set_mode":
+    if data.startswith("model:"):
 
-        keyboard = InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "💬 Все сообщения",
-                    callback_data="mode_all",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "🔤 Только %",
-                    callback_data="mode_percent",
-                ),
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "◀️ Назад",
-                    callback_data="settings_main",
-                ),
-            ],
-        ])
-
-        await query.edit_message_text(
-            "💬 <b>Режим сообщений</b>",
-            parse_mode="HTML",
-            reply_markup=keyboard,
+        index = int(
+            data.split(":")[1]
         )
-        return
 
-    if data == "mode_all":
+        if index < 0 or index >= len(models):
 
-        REPLY_ALL = True
-
-        await query.edit_message_text(
-            "✅ Бот теперь отвечает на все сообщения.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "◀️ Назад",
-                        callback_data="settings_main",
-                    )
-                ]
-            ]),
-        )
-        return
-
-    if data == "mode_percent":
-
-        REPLY_ALL = False
-
-        await query.edit_message_text(
-            "✅ Теперь бот отвечает только на сообщения, "
-            "начинающиеся с %.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "◀️ Назад",
-                        callback_data="settings_main",
-                    )
-                ]
-            ]),
-        )
-        return
-
-    # --------------------------------------------------------
-    # SYSTEM PROMPT
-    # --------------------------------------------------------
-
-    if data == "set_system":
-
-        context.user_data["waiting"] = "system"
-
-        await query.edit_message_text(
-            "📝 <b>System Prompt</b>\n\n"
-            "Теперь отправь новый System Prompt.\n\n"
-            "После отправки он сохранится.\n\n"
-            "/cancel",
-            parse_mode="HTML",
-        )
-        return
-
-    # --------------------------------------------------------
-    # API MENU
-    # --------------------------------------------------------
-
-    if data == "api_menu":
-
-        await show_api_menu(query)
-        return
-
-    # --------------------------------------------------------
-    # CHANGE API
-    # --------------------------------------------------------
-
-    if data == "api_change":
-
-        context.user_data["waiting"] = "api"
-
-        await query.edit_message_text(
-            "🔑 <b>Новый Gemini API ключ</b>\n\n"
-            "Отправь сюда только API ключ.\n\n"
-            "Например:\n"
-            "<code>AIzaSy...</code>\n\n"
-            "/cancel",
-            parse_mode="HTML",
-        )
-        return
-
-    # --------------------------------------------------------
-    # DELETE API
-    # --------------------------------------------------------
-
-    if data == "api_delete":
-
-        GEMINI_API_KEY = ""
-
-        await query.edit_message_text(
-            "🗑 Gemini API ключ удалён.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "◀️ Назад",
-                        callback_data="settings_main",
-                    )
-                ]
-            ]),
-        )
-        return
-
-    # --------------------------------------------------------
-    # CHECK API
-    # --------------------------------------------------------
-
-    if data == "check_api":
-
-        if not GEMINI_API_KEY:
-
-            await query.edit_message_text(
-                "❌ API ключ не установлен.",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton(
-                            "🔑 Добавить ключ",
-                            callback_data="api_change",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "◀️ Назад",
-                            callback_data="settings_main",
-                        )
-                    ],
-                ]),
+            await query.answer(
+                "Модель не найдена.",
+                show_alert=True,
             )
+
             return
+
+        settings["current_model"] = (
+            models[index]
+        )
+
+        save_json(
+            SETTINGS_FILE,
+            settings,
+        )
+
+        await query.answer(
+            f"Выбрана: {models[index]}"
+        )
+
+        await show_models_menu(
+            query
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # ADD MODEL
+    # --------------------------------------------------------
+
+    if data == "model_add":
+
+        await start_add_model(
+            query,
+            context,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # MANAGE MODELS
+    # --------------------------------------------------------
+
+    if data == "model_manage":
+
+        await query.edit_message_text(
+            "🗑 <b>Удаление моделей</b>\n\n"
+            "Нажми на модель, которую "
+            "хочешь удалить.",
+            parse_mode="HTML",
+            reply_markup=model_management_keyboard(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # DELETE MODEL
+    # --------------------------------------------------------
+
+    if data.startswith(
+        "delete_model:"
+    ):
+
+        index = int(
+            data.split(":")[1]
+        )
+
+        if index < 0 or index >= len(models):
+            return
+
+        model = models[index]
+
+        if len(models) <= 1:
+
+            await query.answer(
+                "Нельзя удалить последнюю модель.",
+                show_alert=True,
+            )
+
+            return
+
+        models.pop(index)
+
+        if settings.get(
+            "current_model"
+        ) == model:
+
+            settings["current_model"] = (
+                models[0]
+            )
+
+        save_json(
+            MODELS_FILE,
+            models,
+        )
+
+        save_json(
+            SETTINGS_FILE,
+            settings,
+        )
+
+        await query.answer(
+            "Модель удалена."
+        )
+
+        await query.edit_message_text(
+            "🗑 <b>Удаление моделей</b>\n\n"
+            "Модель удалена.",
+            parse_mode="HTML",
+            reply_markup=model_management_keyboard(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SYNC
+    # --------------------------------------------------------
+
+    if data == "model_sync":
+
+        if not settings.get(
+            "gemini_api_key"
+        ):
+
+            await query.answer(
+                "Сначала добавь Gemini API ключ.",
+                show_alert=True,
+            )
+
+            return
+
+        await query.edit_message_text(
+            "🔄 Получаю список моделей Gemini..."
+        )
 
         try:
 
-            client = get_client()
+            found = await sync_gemini_models()
 
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=GEMINI_MODEL,
-                contents="Ответь одним словом: OK",
+            added = 0
+
+            for model in found:
+
+                if model not in models:
+
+                    models.append(model)
+                    added += 1
+
+            save_json(
+                MODELS_FILE,
+                models,
             )
 
-            answer = response.text or ""
-
             await query.edit_message_text(
-                "✅ <b>Gemini API работает!</b>\n\n"
-                f"Модель: <code>{GEMINI_MODEL}</code>\n"
-                f"Ответ: {answer}",
+                "✅ <b>Список обновлён</b>\n\n"
+                f"Найдено поддерживаемых моделей: "
+                f"{len(found)}\n"
+                f"Новых добавлено: {added}\n\n"
+                "Модели с поддержкой "
+                "<code>generateContent</code> "
+                "добавляются автоматически.",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton(
-                            "◀️ Назад",
-                            callback_data="settings_main",
+                            "🤖 Открыть модели",
+                            callback_data="models_menu",
                         )
                     ]
                 ]),
@@ -836,7 +938,320 @@ async def callback_handler(update, context):
         except Exception as e:
 
             await query.edit_message_text(
-                "❌ <b>Gemini API не работает.</b>\n\n"
+                "❌ Не удалось получить модели Gemini.\n\n"
+                f"<code>{str(e)[:3000]}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "◀️ Назад",
+                            callback_data="models_menu",
+                        )
+                    ]
+                ]),
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # MEMORY MENU
+    # --------------------------------------------------------
+
+    if data == "memory_menu":
+
+        keyboard = InlineKeyboardMarkup([
+
+            [
+                InlineKeyboardButton(
+                    "🚫 Выкл",
+                    callback_data="memory:1",
+                ),
+                InlineKeyboardButton(
+                    "5",
+                    callback_data="memory:5",
+                ),
+                InlineKeyboardButton(
+                    "10",
+                    callback_data="memory:10",
+                ),
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "20",
+                    callback_data="memory:20",
+                ),
+                InlineKeyboardButton(
+                    "50",
+                    callback_data="memory:50",
+                ),
+                InlineKeyboardButton(
+                    "♾️",
+                    callback_data="memory:0",
+                ),
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "🗑 Очистить",
+                    callback_data="clear_memory",
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "◀️ Назад",
+                    callback_data="settings",
+                )
+            ],
+        ])
+
+        await query.edit_message_text(
+            "🧠 <b>Память</b>\n\n"
+            "Выбери размер истории.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # MEMORY SET
+    # --------------------------------------------------------
+
+    if data.startswith("memory:"):
+
+        value = int(
+            data.split(":")[1]
+        )
+
+        settings["history_limit"] = value
+
+        save_json(
+            SETTINGS_FILE,
+            settings,
+        )
+
+        if value == 1:
+            histories.clear()
+
+        text = (
+            "выключена"
+            if value == 1
+            else "без ограничения"
+            if value == 0
+            else f"{value} сообщений"
+        )
+
+        await query.edit_message_text(
+            f"✅ Память: {text}",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "◀️ Назад",
+                        callback_data="settings",
+                    )
+                ]
+            ]),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # MODE MENU
+    # --------------------------------------------------------
+
+    if data == "mode_menu":
+
+        keyboard = InlineKeyboardMarkup([
+
+            [
+                InlineKeyboardButton(
+                    "💬 Все сообщения",
+                    callback_data="mode:all",
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "🔤 Только %",
+                    callback_data="mode:percent",
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "◀️ Назад",
+                    callback_data="settings",
+                )
+            ],
+        ])
+
+        await query.edit_message_text(
+            "💬 <b>Режим</b>",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # MODE SET
+    # --------------------------------------------------------
+
+    if data.startswith("mode:"):
+
+        value = data.split(":")[1]
+
+        settings["reply_all"] = (
+            value == "all"
+        )
+
+        save_json(
+            SETTINGS_FILE,
+            settings,
+        )
+
+        await query.edit_message_text(
+            "✅ Режим изменён.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "◀️ Назад",
+                        callback_data="settings",
+                    )
+                ]
+            ]),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SYSTEM PROMPT
+    # --------------------------------------------------------
+
+    if data == "system_menu":
+
+        context.user_data["waiting"] = (
+            "system"
+        )
+
+        await query.edit_message_text(
+            "📝 <b>System Prompt</b>\n\n"
+            "Отправь новый System Prompt.\n\n"
+            "/cancel",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # API MENU
+    # --------------------------------------------------------
+
+    if data == "api_menu":
+
+        status = (
+            "✅ установлен"
+            if settings.get(
+                "gemini_api_key"
+            )
+            else "❌ отсутствует"
+        )
+
+        await query.edit_message_text(
+            "🔑 <b>Gemini API</b>\n\n"
+            f"Статус: {status}",
+            parse_mode="HTML",
+            reply_markup=api_keyboard(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # API CHANGE
+    # --------------------------------------------------------
+
+    if data == "api_change":
+
+        context.user_data["waiting"] = (
+            "api"
+        )
+
+        await query.edit_message_text(
+            "🔑 <b>Gemini API ключ</b>\n\n"
+            "Отправь только API ключ.\n\n"
+            "Например:\n"
+            "<code>AIza...</code>\n\n"
+            "/cancel",
+            parse_mode="HTML",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # API DELETE
+    # --------------------------------------------------------
+
+    if data == "api_delete":
+
+        settings["gemini_api_key"] = ""
+
+        save_json(
+            SETTINGS_FILE,
+            settings,
+        )
+
+        await query.edit_message_text(
+            "🗑 API ключ удалён.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "◀️ Назад",
+                        callback_data="settings",
+                    )
+                ]
+            ]),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # API CHECK
+    # --------------------------------------------------------
+
+    if data == "api_check":
+
+        try:
+
+            client = get_client()
+
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=get_current_model(),
+                contents="Ответь одним словом: OK",
+            )
+
+            await query.edit_message_text(
+                "✅ <b>API работает</b>\n\n"
+                f"Модель:\n"
+                f"<code>{get_current_model()}</code>\n\n"
+                f"Ответ: {response.text}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "◀️ Назад",
+                            callback_data="api_menu",
+                        )
+                    ]
+                ]),
+            )
+
+        except Exception as e:
+
+            await query.edit_message_text(
+                "❌ <b>API не работает</b>\n\n"
                 f"<code>{str(e)[:3000]}</code>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
@@ -849,7 +1264,7 @@ async def callback_handler(update, context):
                     [
                         InlineKeyboardButton(
                             "◀️ Назад",
-                            callback_data="settings_main",
+                            callback_data="api_menu",
                         )
                     ],
                 ]),
@@ -866,27 +1281,17 @@ async def callback_handler(update, context):
         histories.clear()
 
         await query.edit_message_text(
-            "🗑 Память всех диалогов очищена.",
+            "🗑 Память очищена.",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
                         "◀️ Назад",
-                        callback_data="settings_main",
+                        callback_data="settings",
                     )
                 ]
             ]),
         )
-        return
 
-    # --------------------------------------------------------
-    # CLOSE
-    # --------------------------------------------------------
-
-    if data == "close_settings":
-
-        await query.edit_message_text(
-            "✅ Настройки закрыты."
-        )
         return
 
 
@@ -894,7 +1299,10 @@ async def callback_handler(update, context):
 # CANCEL
 # ============================================================
 
-async def cancel_command(update, context):
+async def cancel_command(
+    update,
+    context,
+):
 
     context.user_data.pop(
         "waiting",
@@ -907,16 +1315,13 @@ async def cancel_command(update, context):
 
 
 # ============================================================
-# SETTINGS TEXT INPUT
+# TEXT INPUT FOR SETTINGS
 # ============================================================
 
 async def process_settings_input(
     update,
     context,
 ):
-
-    global GEMINI_API_KEY
-    global SYSTEM_PROMPT
 
     waiting = context.user_data.get(
         "waiting"
@@ -927,9 +1332,18 @@ async def process_settings_input(
 
     text = update.message.text.strip()
 
+    # --------------------------------------------------------
+    # API
+    # --------------------------------------------------------
+
     if waiting == "api":
 
-        GEMINI_API_KEY = text
+        settings["gemini_api_key"] = text
+
+        save_json(
+            SETTINGS_FILE,
+            settings,
+        )
 
         context.user_data.pop(
             "waiting",
@@ -938,15 +1352,25 @@ async def process_settings_input(
 
         await update.message.reply_text(
             "✅ Gemini API ключ сохранён.\n\n"
-            "Теперь можно нажать:\n"
-            "/settings → 🔄 Проверить API"
+            "Теперь можешь открыть "
+            "/settings → 🔑 Gemini API → "
+            "🔍 Проверить API."
         )
 
         return True
 
+    # --------------------------------------------------------
+    # SYSTEM
+    # --------------------------------------------------------
+
     if waiting == "system":
 
-        SYSTEM_PROMPT = text
+        settings["system_prompt"] = text
+
+        save_json(
+            SETTINGS_FILE,
+            settings,
+        )
 
         context.user_data.pop(
             "waiting",
@@ -959,14 +1383,83 @@ async def process_settings_input(
 
         return True
 
+    # --------------------------------------------------------
+    # MODEL
+    # --------------------------------------------------------
+
+    if waiting == "model_add":
+
+        model = text.strip()
+
+        if model.startswith("models/"):
+
+            model = model[
+                len("models/"):
+            ]
+
+        if model not in models:
+
+            models.append(model)
+
+            save_json(
+                MODELS_FILE,
+                models,
+            )
+
+        settings["current_model"] = model
+
+        save_json(
+            SETTINGS_FILE,
+            settings,
+        )
+
+        context.user_data.pop(
+            "waiting",
+            None,
+        )
+
+        await update.message.reply_text(
+            "✅ <b>Модель добавлена</b>\n\n"
+            f"<code>{model}</code>\n\n"
+            "Она автоматически выбрана.",
+            parse_mode="HTML",
+        )
+
+        return True
+
     return False
+
+
+# ============================================================
+# START
+# ============================================================
+
+async def start_command(
+    update,
+    context,
+):
+
+    await update.message.reply_text(
+        "🤖 <b>Gemini AI Bot</b>\n\n"
+        "Поддерживается:\n"
+        "📝 текст\n"
+        "🖼 фото\n"
+        "🎬 видео\n"
+        "🎵 аудио\n"
+        "📄 документы\n\n"
+        "⚙️ /settings — настройки",
+        parse_mode="HTML",
+    )
 
 
 # ============================================================
 # TEXT
 # ============================================================
 
-async def text_handler(update, context):
+async def text_handler(
+    update,
+    context,
+):
 
     if update.effective_user.id == OWNER_ID:
 
@@ -978,7 +1471,10 @@ async def text_handler(update, context):
 
     text = update.message.text.strip()
 
-    if not REPLY_ALL:
+    if not settings.get(
+        "reply_all",
+        True,
+    ):
 
         if not text.startswith("%"):
             return
@@ -1019,15 +1515,15 @@ async def text_handler(update, context):
 # PHOTO
 # ============================================================
 
-async def photo_handler(update, context):
+async def photo_handler(
+    update,
+    context,
+):
 
     prompt = (
         update.message.caption
         or "Подробно опиши это изображение."
     )
-
-    if prompt.startswith("%"):
-        prompt = prompt[1:].strip()
 
     try:
 
@@ -1037,7 +1533,7 @@ async def photo_handler(update, context):
 
         photo = update.message.photo[-1]
 
-        file = await context.bot.get_file(
+        tg_file = await context.bot.get_file(
             photo.file_id
         )
 
@@ -1048,7 +1544,9 @@ async def photo_handler(update, context):
 
             path = tmp.name
 
-        await file.download_to_drive(path)
+        await tg_file.download_to_drive(
+            path
+        )
 
         try:
 
@@ -1084,15 +1582,15 @@ async def photo_handler(update, context):
 # VIDEO
 # ============================================================
 
-async def video_handler(update, context):
+async def video_handler(
+    update,
+    context,
+):
 
     prompt = (
         update.message.caption
         or "Подробно проанализируй это видео."
     )
-
-    if prompt.startswith("%"):
-        prompt = prompt[1:].strip()
 
     try:
 
@@ -1102,7 +1600,7 @@ async def video_handler(update, context):
 
         video = update.message.video
 
-        file = await context.bot.get_file(
+        tg_file = await context.bot.get_file(
             video.file_id
         )
 
@@ -1113,7 +1611,9 @@ async def video_handler(update, context):
 
             path = tmp.name
 
-        await file.download_to_drive(path)
+        await tg_file.download_to_drive(
+            path
+        )
 
         try:
 
@@ -1155,15 +1655,15 @@ async def video_handler(update, context):
 # AUDIO
 # ============================================================
 
-async def audio_handler(update, context):
+async def audio_handler(
+    update,
+    context,
+):
 
     prompt = (
         update.message.caption
         or "Прослушай аудио и подробно опиши его содержание."
     )
-
-    if prompt.startswith("%"):
-        prompt = prompt[1:].strip()
 
     try:
 
@@ -1181,7 +1681,7 @@ async def audio_handler(update, context):
             file_id = update.message.audio.file_id
             suffix = ".mp3"
 
-        file = await context.bot.get_file(
+        tg_file = await context.bot.get_file(
             file_id
         )
 
@@ -1192,7 +1692,9 @@ async def audio_handler(update, context):
 
             path = tmp.name
 
-        await file.download_to_drive(path)
+        await tg_file.download_to_drive(
+            path
+        )
 
         try:
 
@@ -1228,15 +1730,15 @@ async def audio_handler(update, context):
 # DOCUMENT
 # ============================================================
 
-async def document_handler(update, context):
+async def document_handler(
+    update,
+    context,
+):
 
     prompt = (
         update.message.caption
         or "Проанализируй этот документ и выдели главное."
     )
-
-    if prompt.startswith("%"):
-        prompt = prompt[1:].strip()
 
     try:
 
@@ -1246,7 +1748,7 @@ async def document_handler(update, context):
 
         document = update.message.document
 
-        file = await context.bot.get_file(
+        tg_file = await context.bot.get_file(
             document.file_id
         )
 
@@ -1266,7 +1768,9 @@ async def document_handler(update, context):
 
             path = tmp.name
 
-        await file.download_to_drive(path)
+        await tg_file.download_to_drive(
+            path
+        )
 
         try:
 
@@ -1302,10 +1806,13 @@ async def document_handler(update, context):
 # ERROR
 # ============================================================
 
-async def error_handler(update, context):
+async def error_handler(
+    update,
+    context,
+):
 
     logging.error(
-        "Unhandled exception:",
+        "Unhandled exception",
         exc_info=context.error,
     )
 
@@ -1319,7 +1826,7 @@ def main():
     if not BOT_TOKEN:
 
         raise RuntimeError(
-            "BOT_TOKEN не задан."
+            "Не задан BOT_TOKEN."
         )
 
     logging.basicConfig(
@@ -1359,14 +1866,14 @@ def main():
         )
     )
 
-    # Inline buttons
+    # Buttons
     application.add_handler(
         CallbackQueryHandler(
             callback_handler
         )
     )
 
-    # Media
+    # Photo
     application.add_handler(
         MessageHandler(
             filters.PHOTO,
@@ -1374,6 +1881,7 @@ def main():
         )
     )
 
+    # Video
     application.add_handler(
         MessageHandler(
             filters.VIDEO,
@@ -1381,6 +1889,7 @@ def main():
         )
     )
 
+    # Voice
     application.add_handler(
         MessageHandler(
             filters.VOICE,
@@ -1388,6 +1897,7 @@ def main():
         )
     )
 
+    # Audio
     application.add_handler(
         MessageHandler(
             filters.AUDIO,
@@ -1395,6 +1905,7 @@ def main():
         )
     )
 
+    # Documents
     application.add_handler(
         MessageHandler(
             filters.Document.ALL,
