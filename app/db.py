@@ -35,6 +35,13 @@ class DB:
                     created_at TEXT
                 )
             ''')
+            # users table for per-user API keys and preferences
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    api_key_enc TEXT
+                )
+            ''')
             conn.commit()
             conn.close()
 
@@ -119,5 +126,29 @@ class DB:
             conn = self._conn()
             cur = conn.cursor()
             cur.execute('UPDATE chats SET prompt = NULL, temperature = 0.7, history_length = 10, model = NULL, image_size = "1024x1024", enabled = 1 WHERE chat_id = ?', (chat_id,))
+            conn.commit()
+            conn.close()
+
+    # User API key management (per-user keys)
+    def set_user_api_key_enc(self, user_id, api_key_enc):
+        with self.lock:
+            conn = self._conn()
+            cur = conn.cursor()
+            cur.execute('INSERT OR REPLACE INTO users (user_id, api_key_enc) VALUES (?,?)', (user_id, api_key_enc))
+            conn.commit()
+            conn.close()
+
+    def get_user_api_key_enc(self, user_id):
+        conn = self._conn()
+        cur = conn.cursor()
+        cur.execute('SELECT api_key_enc FROM users WHERE user_id = ?', (user_id,))
+        row = cur.fetchone()
+        return row[0] if row and row[0] else None
+
+    def remove_user_api_key(self, user_id):
+        with self.lock:
+            conn = self._conn()
+            cur = conn.cursor()
+            cur.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
             conn.commit()
             conn.close()

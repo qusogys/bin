@@ -4,3 +4,4 @@ python-dotenv
 Pillow
 pytesseract
 sqlalchemy
+cryptography

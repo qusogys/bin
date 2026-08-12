@@ -1,17 +1,18 @@
-## Gemini integration and webhook
+Добавлена возможность сохранять личные API ключи (per-user) через Telegram.
 
-I implemented a generic Gemini adapter and added webhook support.
+Как это работает
+- Пользователь может открыть /settings и нажать кнопку "API Key" или использовать команду /setkey <ключ>.
+- Ключ будет зашифрован с использованием MASTER_KEY (переменная окружения) и сохранён в базе в таблице users.
+- При отправке запроса бот попытается использовать личный ключ (если он сохранён и корректно расшифрован). В противном случае используется глобальный ключ GEMINI_API_KEY (env) или OPENAI_API_KEY.
 
-To use Gemini via a REST endpoint provide the following ENV vars:
-- GEMINI_API_KEY — bearer token for Gemini
-- GEMINI_API_ENDPOINT — full URL to the model prediction endpoint (e.g. https://us-central1-aiplatform.googleapis.com/v1/projects/...) if using PaLM/Vertex AI
-- GEMINI_MODEL_CHAT — model name for chat (optional)
-- GEMINI_MODEL_IMAGE — model name for images (optional)
+Требования для включения хранения ключей
+- В ENV/Secrets на Railway должен быть установлен MASTER_KEY (ненулевая строка). Она используется только для шифрования ключей в базе. Без MASTER_KEY сохранение ключов отключено и бот будет сообщать об этом.
 
-Webhook support:
-- Set USE_WEBHOOK=1, WEBHOOK_URL (public URL), and optionally WEBHOOK_PATH (default /webhook), PORT and HOST.
+Команды
+- /setkey <ключ> — сохранить персональный ключ (зашифрован)
+- /removekey — удалить персональный ключ
+- /settings -> API Key — тоже позволяет отправить ключ
 
-Notes:
-- The Gemini adapter is intentionally generic: different Gemini/PaLM endpoints differ in request/response shape. Provide GEMINI_API_ENDPOINT that accepts the minimal payload used by the adapter ("model", "input", "temperature"). You can tweak ai_client._call_gemini to match the exact API response structure of your endpoint.
-- If GEMINI_* envs are not provided, the client will fall back to OpenAI if OPENAI_API_KEY is set.
-
+Безопасность
+- MASTER_KEY и глобальные ключи (GEMINI_API_KEY / OPENAI_API_KEY) должны храниться в Railway Secrets / Environment.
+- Никогда не присылай ключи в общедоступных чатах.

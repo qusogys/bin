@@ -7,6 +7,7 @@ class Settings:
     TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
     # Gemini settings
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    GEMINI_API_ENDPOINT = os.getenv('GEMINI_API_ENDPOINT')
     GEMINI_MODEL_CHAT = os.getenv('GEMINI_MODEL_CHAT', 'gemini')
     GEMINI_MODEL_IMAGE = os.getenv('GEMINI_MODEL_IMAGE', 'vision')
 
@@ -17,5 +18,6 @@ class Settings:
     IMAGE_PROVIDER = os.getenv('IMAGE_PROVIDER','gemini')
     IMAGE_DEFAULT_SIZE = os.getenv('IMAGE_DEFAULT_SIZE','1024x1024')
     DEFAULT_TEMPERATURE = float(os.getenv('DEFAULT_TEMPERATURE','0.7'))
+    MASTER_KEY = os.getenv('MASTER_KEY')
 
 settings = Settings()

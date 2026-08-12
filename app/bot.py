@@ -1,4 +1,3 @@
-import os
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -6,6 +5,7 @@ from .config import settings
 from .db import DB
 from .ai_client import AIClient
 from .ocr import ocr_image
+from .utils import encrypt_value, decrypt_value
 from io import BytesIO
 from PIL import Image
 
@@ -21,7 +21,7 @@ pending_actions = {}  # chat_id -> action string
 @dp.message(Command('start'))
 async def cmd_start(message: Message):
     db.ensure_chat(message.chat.id)
-    await message.reply("Привет! Я AI-бот. Используй /settings для управления, /on и /off для включения/выключения бота в чате. /setprompt работает тоже.")
+    await message.reply("Привет! Я AI-бот. Используй /settings для управления, /on и /off для включения/выключения бота в чате. /setprompt работает тоже. Чтобы задать свой API ключ для Gemini/OpenAI, открой /settings и выбери 'API Key'.")
 
 @dp.message(Command('setprompt'))
 async def cmd_setprompt(message: Message):
@@ -31,6 +31,26 @@ async def cmd_setprompt(message: Message):
         return
     db.set_prompt(message.chat.id, text)
     await message.reply('Промпт сохранён для этого чата.')
+
+@dp.message(Command('setkey'))
+async def cmd_setkey(message: Message):
+    text = message.get_args()
+    if not text:
+        await message.reply('Использование: /setkey ВАШ_API_КЛЮЧ')
+        return
+    user_id = message.from_user.id
+    if not settings.MASTER_KEY:
+        await message.reply('Хранение ключей отключено на сервере — MASTER_KEY не настроен. Обратись к администратору.')
+        return
+    enc = encrypt_value(text.strip(), settings.MASTER_KEY)
+    db.set_user_api_key_enc(user_id, enc)
+    await message.reply('Твой API ключ сохранён безопасно (зашифрован).')
+
+@dp.message(Command('removekey'))
+async def cmd_removekey(message: Message):
+    user_id = message.from_user.id
+    db.remove_user_api_key(user_id)
+    await message.reply('Твой API ключ удалён.')
 
 @dp.message(Command('on'))
 async def cmd_on(message: Message):
@@ -49,23 +69,29 @@ async def cmd_settings(message: Message):
     db.ensure_chat(message.chat.id)
     s = db.get_settings(message.chat.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='API Key', callback_data='settings:apikey')],
         [InlineKeyboardButton(text='Промпт', callback_data='settings:prompt')],
         [InlineKeyboardButton(text='Модель', callback_data='settings:model'), InlineKeyboardButton(text='Параметры', callback_data='settings:params')],
         [InlineKeyboardButton(text='Показать настройки', callback_data='settings:show')],
         [InlineKeyboardButton(text='Сбросить в дефолт', callback_data='settings:reset')]
     ])
     enabled_text = 'Включён' if s.get('enabled') else 'Выключен'
-    await message.reply(f"Настройки для этого чата:\nПромпт: {s.get('prompt') or '<не задан>'}\nМодель: {s.get('model') or settings.GEMINI_MODEL_CHAT}\nТемпература: {s.get('temperature')}\nРазмер картинки: {s.get('image_size')}\nСтатус: {enabled_text}", reply_markup=kb)
+    await message.reply(f"Настройки для этого чата:\nПромпт: {s.get('prompt') or '<не задан>'}\nМодель: {s.get('model') or settings.GEMINI_MODEL_CHAT}\nТемпература: {s.get('temperature')}\nРазмер картинки: {s.get('image_size')}\nСтатус: {enabled_text}\n\nЧтобы сохранить личный API-ключ (будет зашифрован), нажми 'API Key' в меню или используй /setkey <ключ>.", reply_markup=kb)
 
 @dp.callback_query()
 async def callback_settings(cb: CallbackQuery):
     data = cb.data or ''
     chat_id = cb.message.chat.id
+    user_id = cb.from_user.id
     if not data.startswith('settings:'):
         await cb.answer()
         return
     cmd = data.split(':', 1)[1]
-    if cmd == 'prompt':
+    if cmd == 'apikey':
+        pending_actions[user_id] = 'set_api_key'
+        await cb.message.reply('Отправь свой API ключ в сообщении (он будет зашифрован и сохранён). Отправь /cancel чтобы отменить.')
+        await cb.answer()
+    elif cmd == 'prompt':
         pending_actions[chat_id] = 'set_prompt'
         await cb.message.reply('Отправь новый системный промпт для этого чата. Отправь /cancel чтобы отменить.')
         await cb.answer()
@@ -80,7 +106,7 @@ async def callback_settings(cb: CallbackQuery):
     elif cmd == 'show':
         s = db.get_settings(chat_id)
         enabled_text = 'Включён' if s.get('enabled') else 'Выключен'
-        await cb.message.reply(f"Текущие настройки:\nПромпт: {s.get('prompt') or '<не задан>'}\nМодель: {s.get('model') or settings.GEMINI_MODEL_CHAT}\nТемпература: {s.get('temperature')}\nРазмер картинки: {s.get('image_size')}\nИстория: {s.get('history_length')}\nСтатус: {enabled_text}")
+        await cb.message.reply(f"Текущие настройки:\nПромпт: {s.get('prompt') or '<не задан>'}\nМодель: {s.get('model') or settings.GEMINI_MODEL_CHAT}\nТемпература: {s.get('temperature')}\nРазмер картинки: {s.get('image_size')}\nИстория: {s.get('history_length')}\nСта��ус: {enabled_text}")
         await cb.answer()
     elif cmd == 'reset':
         db.reset_settings(chat_id)
@@ -92,18 +118,37 @@ async def callback_settings(cb: CallbackQuery):
 @dp.message(Command('cancel'))
 async def cmd_cancel(message: Message):
     chat_id = message.chat.id
+    user_id = message.from_user.id
     if chat_id in pending_actions:
         pending_actions.pop(chat_id)
         await message.reply('Действие отменено.')
-    else:
-        await message.reply('Нет активного действия.')
+        return
+    if user_id in pending_actions:
+        pending_actions.pop(user_id)
+        await message.reply('Действие отменено.')
+        return
+    await message.reply('Нет активного действия.')
 
 @dp.message()
 async def handle_message(message: Message):
     chat_id = message.chat.id
+    user_id = message.from_user.id
     db.ensure_chat(chat_id)
 
-    # If user is in pending action flow
+    # If user is in pending action flow (per-user actions keyed by user_id)
+    if user_id in pending_actions:
+        action = pending_actions.pop(user_id)
+        text = message.text or ''
+        if action == 'set_api_key':
+            if not settings.MASTER_KEY:
+                await message.reply('Хранение ключей отключено на сервере — MASTER_KEY не настроен. Обратись к администратору.')
+                return
+            enc = encrypt_value(text.strip(), settings.MASTER_KEY)
+            db.set_user_api_key_enc(user_id, enc)
+            await message.reply('Твой API ключ сохранён безопасно (зашифрован).')
+            return
+
+    # If chat is in pending action flow (per-chat actions keyed by chat_id)
     if chat_id in pending_actions:
         action = pending_actions.pop(chat_id)
         text = message.text or ''
@@ -171,7 +216,15 @@ async def handle_message(message: Message):
         # read per-chat model/temperature
         model = db.get_setting(chat_id, 'model') or settings.GEMINI_MODEL_CHAT
         temperature = db.get_setting(chat_id, 'temperature') or settings.DEFAULT_TEMPERATURE
-        reply = ai.chat_reply(system_prompt=prompt, history=history, model=model, temperature=temperature)
+        # try per-user API key first
+        api_key = None
+        enc = db.get_user_api_key_enc(user_id)
+        if enc and settings.MASTER_KEY:
+            try:
+                api_key = decrypt_value(enc, settings.MASTER_KEY)
+            except Exception as e:
+                print('Error decrypting user api key', e)
+        reply = ai.chat_reply(system_prompt=prompt, history=history, model=model, temperature=temperature, api_key=api_key)
         if reply:
             db.add_message(chat_id, 'assistant', reply)
             await message.reply(reply)

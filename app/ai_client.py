@@ -11,12 +11,12 @@ import requests
 class AIClient:
     def __init__(self, settings):
         self.settings = settings
-        self.gemini_key = getattr(settings, 'GEMINI_API_KEY', None)
-        self.gemini_endpoint = os.getenv('GEMINI_API_ENDPOINT')
+        self.default_gemini_key = getattr(settings, 'GEMINI_API_KEY', None)
+        self.gemini_endpoint = getattr(settings, 'GEMINI_API_ENDPOINT', None) or os.getenv('GEMINI_API_ENDPOINT')
         self.openai_key = os.getenv('OPENAI_API_KEY')
         # if openai is available, import lazily
         self._openai = None
-        if not self.gemini_key and self.openai_key:
+        if not self.default_gemini_key and self.openai_key:
             try:
                 import openai
                 openai.api_key = self.openai_key
@@ -24,11 +24,12 @@ class AIClient:
             except Exception:
                 self._openai = None
 
-    def _call_gemini(self, payload: dict):
-        if not self.gemini_endpoint or not self.gemini_key:
+    def _call_gemini(self, payload: dict, api_key: str = None):
+        key = api_key or self.default_gemini_key
+        if not self.gemini_endpoint or not key:
             raise RuntimeError('Gemini endpoint or key not configured')
         headers = {
-            'Authorization': f'Bearer {self.gemini_key}',
+            'Authorization': f'Bearer {key}',
             'Content-Type': 'application/json',
         }
         try:
@@ -39,11 +40,11 @@ class AIClient:
             print('Gemini call error', e, getattr(e, 'response', None))
             return None
 
-    def chat_reply(self, system_prompt: str, history: list, model: str = None, temperature: float = 0.7):
+    def chat_reply(self, system_prompt: str, history: list, model: str = None, temperature: float = 0.7, api_key: str = None):
         # history is a list of (role, content)
         model = model or getattr(self.settings, 'GEMINI_MODEL_CHAT', None)
         # Prepare a simple input structure; adjust as needed for the actual Gemini API
-        if self.gemini_key and self.gemini_endpoint:
+        if (api_key or self.default_gemini_key) and self.gemini_endpoint:
             # Build messages as a single prompt
             parts = []
             if system_prompt:
@@ -57,7 +58,7 @@ class AIClient:
                 'temperature': temperature,
                 'max_output_tokens': 800,
             }
-            result = self._call_gemini(payload)
+            result = self._call_gemini(payload, api_key=api_key)
             if not result:
                 return None
             # Try common response shapes
@@ -105,18 +106,19 @@ class AIClient:
         print('No AI backend configured')
         return None
 
-    def generate_image(self, prompt: str, size: str = '1024x1024'):
+    def generate_image(self, prompt: str, size: str = '1024x1024', api_key: str = None):
         # Gemini image endpoint may differ; use GEMINI_IMAGE_ENDPOINT if provided
         gemini_image_endpoint = os.getenv('GEMINI_IMAGE_ENDPOINT')
         model = getattr(self.settings, 'GEMINI_MODEL_IMAGE', None)
-        if self.gemini_key and gemini_image_endpoint:
+        key = api_key or self.default_gemini_key
+        if key and gemini_image_endpoint:
             payload = {
                 'model': model,
                 'prompt': prompt,
                 'size': size,
                 'n': 1,
             }
-            result = self._call_gemini(payload)
+            result = self._call_gemini(payload, api_key=api_key)
             if not result:
                 return None
             # Try to find a URL or base64 image
