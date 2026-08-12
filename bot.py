@@ -25,17 +25,13 @@ from google.genai import types
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Единственный человек, который может менять настройки
 OWNER_ID = 8904429775
 
-# Модель по умолчанию
 DEFAULT_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.5-flash-lite"
 )
 
-# API key можно сразу задать в Railway Variables.
-# После этого его также можно поменять через /settings.
 DEFAULT_API_KEY = os.getenv(
     "GEMINI_API_KEY",
     ""
@@ -48,11 +44,15 @@ DEFAULT_PROMPT = os.getenv(
     "Будь полезным, точным и понятным."
 )
 
-# false = отвечать только на %
-# true = отвечать на все сообщения
 DEFAULT_ENABLED = (
     os.getenv("BOT_ENABLED", "false").lower()
     in ("true", "1", "yes", "on")
+)
+
+# 0 = без ограничения
+# 1 = не помнить предыдущие сообщения
+DEFAULT_HISTORY_LIMIT = int(
+    os.getenv("HISTORY_LIMIT", "10")
 )
 
 if not BOT_TOKEN:
@@ -65,22 +65,74 @@ if not BOT_TOKEN:
 # GLOBAL SETTINGS
 # ============================================================
 
-# Всё хранится в памяти.
-#
-# ВАЖНО:
-# после перезапуска Railway значения снова возьмутся
-# из Railway Variables.
-
 settings = {
     "api_key": DEFAULT_API_KEY,
     "model": DEFAULT_MODEL,
     "prompt": DEFAULT_PROMPT,
     "enabled": DEFAULT_ENABLED,
+    "history_limit": DEFAULT_HISTORY_LIMIT,
 }
 
 
 # ============================================================
-# AVAILABLE MODELS
+# CHAT HISTORY
+# ============================================================
+
+# История хранится отдельно для каждого Telegram chat_id.
+#
+# Например:
+#
+# chat_histories = {
+#     123456: [
+#         {"role": "user", "text": "Привет"},
+#         {"role": "model", "text": "Привет!"},
+#     ],
+#
+#     987654: [
+#         ...
+#     ]
+# }
+#
+# После перезапуска Railway история очистится.
+
+chat_histories: dict[int, list[dict[str, str]]] = {}
+
+
+def get_chat_history(chat_id: int):
+    if chat_id not in chat_histories:
+        chat_histories[chat_id] = []
+
+    return chat_histories[chat_id]
+
+
+def clear_chat_history(chat_id: int):
+    chat_histories[chat_id] = []
+
+
+def add_to_history(
+    chat_id: int,
+    user_text: str,
+    assistant_text: str,
+):
+    history = get_chat_history(chat_id)
+
+    history.append(
+        {
+            "role": "user",
+            "text": user_text,
+        }
+    )
+
+    history.append(
+        {
+            "role": "model",
+            "text": assistant_text,
+        }
+    )
+
+
+# ============================================================
+# MODELS
 # ============================================================
 
 MODELS = {
@@ -104,6 +156,7 @@ dp = Dispatcher()
 class SettingsState(StatesGroup):
     waiting_api_key = State()
     waiting_prompt = State()
+    waiting_history_limit = State()
 
 
 # ============================================================
@@ -131,6 +184,15 @@ def settings_keyboard():
         if settings["enabled"]
         else "🔴 ВЫКЛ"
     )
+
+    history_limit = settings["history_limit"]
+
+    if history_limit == 0:
+        history_text = "♾ без лимита"
+    elif history_limit == 1:
+        history_text = "1 — без памяти"
+    else:
+        history_text = str(history_limit)
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -164,9 +226,23 @@ def settings_keyboard():
 
             [
                 InlineKeyboardButton(
+                    text=f"🧠 История: {history_text}",
+                    callback_data="settings_history",
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🗑 Очистить историю",
+                    callback_data="settings_clear_history",
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
                     text="🔄 Обновить",
                     callback_data="settings_refresh",
-                ),
+                )
             ],
         ]
     )
@@ -227,6 +303,27 @@ def settings_text():
         "начинающиеся с <code>%</code>."
     )
 
+    history_limit = settings["history_limit"]
+
+    if history_limit == 0:
+
+        history_text = (
+            "♾ <b>Без лимита</b>"
+        )
+
+    elif history_limit == 1:
+
+        history_text = (
+            "1 — <b>без памяти</b>"
+        )
+
+    else:
+
+        history_text = (
+            f"<b>{history_limit}</b> "
+            "сообщений"
+        )
+
     prompt = settings["prompt"]
 
     if len(prompt) > 1000:
@@ -244,6 +341,8 @@ def settings_text():
 
         f"📡 Режим:\n{mode}\n\n"
 
+        f"🧠 <b>История:</b> {history_text}\n\n"
+
         "🎭 <b>Роль / system prompt:</b>\n"
         f"<blockquote>{prompt}</blockquote>\n\n"
 
@@ -256,7 +355,7 @@ def settings_text():
 # ============================================================
 
 @dp.message(Command("start"))
-async def start(message: Message):
+async def start_command(message: Message):
 
     await message.answer(
         "👋 <b>Gemini Telegram Bot</b>\n\n"
@@ -352,7 +451,7 @@ async def settings_api(
         "Этот ключ будет использоваться "
         "во всех чатах.\n\n"
 
-        "Для отмены используй:\n"
+        "Для отмены:\n"
         "/cancel",
 
         parse_mode="HTML",
@@ -370,7 +469,6 @@ async def save_api_key(
     if not is_owner(message.from_user.id):
 
         await state.clear()
-
         return
 
     if not message.text:
@@ -401,7 +499,6 @@ async def save_api_key(
             api_key=api_key
         )
 
-        # Проверяем, что ключ работает.
         await asyncio.to_thread(
             lambda: list(
                 client.models.list(
@@ -416,8 +513,7 @@ async def save_api_key(
 
         await message.answer(
             "❌ API key не прошёл проверку.\n\n"
-            f"<code>{str(error)[:2000]}</code>",
-
+            f"<code>{escape_html(str(error)[:2000])}</code>",
             parse_mode="HTML",
         )
 
@@ -488,7 +584,6 @@ async def save_prompt(
     if not is_owner(message.from_user.id):
 
         await state.clear()
-
         return
 
     if not message.text:
@@ -520,10 +615,146 @@ async def save_prompt(
 
 
 # ============================================================
+# HISTORY LIMIT
+# ============================================================
+
+@dp.callback_query(F.data == "settings_history")
+async def settings_history(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+
+    if not is_owner(callback.from_user.id):
+
+        await callback.answer(
+            "⛔ Нет доступа.",
+            show_alert=True,
+        )
+
+        return
+
+    await state.set_state(
+        SettingsState.waiting_history_limit
+    )
+
+    current = settings["history_limit"]
+
+    await callback.message.answer(
+        "🧠 <b>Лимит истории</b>\n\n"
+
+        "Отправь число.\n\n"
+
+        "Примеры:\n"
+        "• <code>0</code> — без лимита\n"
+        "• <code>1</code> — ничего не помнить\n"
+        "• <code>5</code> — помнить последние сообщения\n"
+        "• <code>20</code> — помнить больше контекста\n\n"
+
+        f"Текущее значение: <b>{current}</b>\n\n"
+
+        "Для отмены:\n"
+        "/cancel",
+
+        parse_mode="HTML",
+    )
+
+    await callback.answer()
+
+
+@dp.message(SettingsState.waiting_history_limit)
+async def save_history_limit(
+    message: Message,
+    state: FSMContext,
+):
+
+    if not is_owner(message.from_user.id):
+
+        await state.clear()
+        return
+
+    if not message.text:
+
+        await message.answer(
+            "❌ Отправь число."
+        )
+
+        return
+
+    try:
+
+        limit = int(
+            message.text.strip()
+        )
+
+    except ValueError:
+
+        await message.answer(
+            "❌ Нужно отправить целое число.\n\n"
+            "Например: <code>10</code>",
+            parse_mode="HTML",
+        )
+
+        return
+
+    if limit < 0:
+
+        await message.answer(
+            "❌ Число не может быть меньше 0."
+        )
+
+        return
+
+    settings["history_limit"] = limit
+
+    await state.clear()
+
+    await message.answer(
+        f"✅ Лимит истории установлен: <b>{limit}</b>\n\n"
+        "Изменение применяется ко всем чатам.",
+        reply_markup=settings_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# CLEAR HISTORY
+# ============================================================
+
+@dp.callback_query(
+    F.data == "settings_clear_history"
+)
+async def settings_clear_history(
+    callback: CallbackQuery,
+):
+
+    if not is_owner(callback.from_user.id):
+
+        await callback.answer(
+            "⛔ Нет доступа.",
+            show_alert=True,
+        )
+
+        return
+
+    # Очищаем историю того чата,
+    # где владелец нажал кнопку.
+
+    clear_chat_history(
+        callback.message.chat.id
+    )
+
+    await callback.answer(
+        "🗑 История этого чата очищена."
+    )
+
+
+# ============================================================
 # MODEL
 # ============================================================
 
-@dp.callback_query(F.data == "settings_model")
+@dp.callback_query(
+    F.data == "settings_model"
+)
 async def settings_model(
     callback: CallbackQuery,
 ):
@@ -548,7 +779,9 @@ async def settings_model(
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("model:"))
+@dp.callback_query(
+    F.data.startswith("model:")
+)
 async def select_model(
     callback: CallbackQuery,
 ):
@@ -691,7 +924,7 @@ async def settings_back(
 
 
 # ============================================================
-# DOWNLOAD TELEGRAM MEDIA
+# DOWNLOAD MEDIA
 # ============================================================
 
 async def download_media(message: Message):
@@ -702,9 +935,7 @@ async def download_media(message: Message):
         )
     )
 
-    # -------------------------
     # PHOTO
-    # -------------------------
 
     if message.photo:
 
@@ -725,9 +956,7 @@ async def download_media(message: Message):
             "image/jpeg",
         )
 
-    # -------------------------
     # VOICE
-    # -------------------------
 
     if message.voice:
 
@@ -748,9 +977,7 @@ async def download_media(message: Message):
             "audio/ogg",
         )
 
-    # -------------------------
     # AUDIO
-    # -------------------------
 
     if message.audio:
 
@@ -770,20 +997,14 @@ async def download_media(message: Message):
             destination=path,
         )
 
-        mime_type = (
-            message.audio.mime_type
-            or "audio/mpeg"
-        )
-
         return (
             temp_dir,
             path,
-            mime_type,
+            message.audio.mime_type
+            or "audio/mpeg",
         )
 
-    # -------------------------
     # VIDEO
-    # -------------------------
 
     if message.video:
 
@@ -798,20 +1019,14 @@ async def download_media(message: Message):
             destination=path,
         )
 
-        mime_type = (
-            message.video.mime_type
-            or "video/mp4"
-        )
-
         return (
             temp_dir,
             path,
-            mime_type,
+            message.video.mime_type
+            or "video/mp4",
         )
 
-    # -------------------------
     # VIDEO NOTE
-    # -------------------------
 
     if message.video_note:
 
@@ -832,9 +1047,7 @@ async def download_media(message: Message):
             "video/mp4",
         )
 
-    # -------------------------
     # DOCUMENT
-    # -------------------------
 
     if message.document:
 
@@ -854,15 +1067,11 @@ async def download_media(message: Message):
             destination=path,
         )
 
-        mime_type = (
-            message.document.mime_type
-            or "application/octet-stream"
-        )
-
         return (
             temp_dir,
             path,
-            mime_type,
+            message.document.mime_type
+            or "application/octet-stream",
         )
 
     return (
@@ -873,10 +1082,109 @@ async def download_media(message: Message):
 
 
 # ============================================================
+# BUILD GEMINI CONTENT
+# ============================================================
+
+def build_history_contents(
+    chat_id: int,
+    current_prompt: str,
+):
+    """
+    Формируем контекст для Gemini.
+
+    history_limit:
+        0 = вся история
+        1 = только текущий запрос
+        N = текущий запрос + N-1 предыдущих сообщений
+    """
+
+    contents = []
+
+    limit = settings["history_limit"]
+
+    history = get_chat_history(chat_id)
+
+    if limit == 1:
+
+        # Полностью без памяти.
+
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=current_prompt
+                    )
+                ],
+            )
+        )
+
+        return contents
+
+    # --------------------------------------------------------
+    # Выбираем историю
+    # --------------------------------------------------------
+
+    if limit == 0:
+
+        selected_history = history
+
+    else:
+
+        # Например limit=5:
+        # берём максимум 4 старых сообщения
+        # + текущий запрос.
+
+        old_messages_count = max(
+            limit - 1,
+            0,
+        )
+
+        selected_history = history[
+            -old_messages_count:
+        ] if old_messages_count > 0 else []
+
+    # --------------------------------------------------------
+    # Старые сообщения
+    # --------------------------------------------------------
+
+    for item in selected_history:
+
+        contents.append(
+            types.Content(
+                role=item["role"],
+                parts=[
+                    types.Part.from_text(
+                        text=item["text"]
+                    )
+                ],
+            )
+        )
+
+    # --------------------------------------------------------
+    # Текущий запрос
+    # --------------------------------------------------------
+
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[
+                types.Part.from_text(
+                    text=current_prompt
+                )
+            ],
+        )
+    )
+
+    return contents
+
+
+# ============================================================
 # GEMINI
 # ============================================================
 
 async def ask_gemini(
+    chat_id: int,
     prompt: str,
     media_path=None,
     mime_type=None,
@@ -885,40 +1193,31 @@ async def ask_gemini(
     if not settings["api_key"]:
 
         raise RuntimeError(
-            "Gemini API key не установлен. "
-            "Владелец должен открыть /settings."
+            "Gemini API key не установлен.\n\n"
+            "Владелец должен открыть /settings "
+            "и установить API key."
         )
 
     client = genai.Client(
         api_key=settings["api_key"]
     )
 
-    contents = []
+    # --------------------------------------------------------
+    # История
+    # --------------------------------------------------------
 
-    # Текст пользователя
+    contents = build_history_contents(
+        chat_id,
+        prompt,
+    )
 
-    if prompt:
-        contents.append(prompt)
-
-    # Если текста нет,
-    # но есть файл
-
-    if not prompt and media_path:
-
-        contents.append(
-            "Проанализируй предоставленный файл."
-        )
-
-    # -------------------------
+    # --------------------------------------------------------
     # MEDIA
-    # -------------------------
+    # --------------------------------------------------------
 
     if media_path:
 
         file_size = media_path.stat().st_size
-
-        # Небольшие файлы
-        # отправляем непосредственно.
 
         if file_size <= 20 * 1024 * 1024:
 
@@ -926,15 +1225,15 @@ async def ask_gemini(
                 media_path.read_bytes
             )
 
-            contents.append(
+            # Добавляем файл к последнему
+            # сообщению пользователя.
+
+            contents[-1].parts.append(
                 types.Part.from_bytes(
                     data=data,
                     mime_type=mime_type,
                 )
             )
-
-        # Большие файлы
-        # загружаем через Gemini Files API.
 
         else:
 
@@ -947,15 +1246,13 @@ async def ask_gemini(
                 )
             )
 
-            contents.append(
+            contents[-1].parts.append(
                 uploaded_file
             )
 
-    if not contents:
-
-        contents.append(
-            "Ответь на запрос пользователя."
-        )
+    # --------------------------------------------------------
+    # Gemini
+    # --------------------------------------------------------
 
     response = await asyncio.to_thread(
         client.models.generate_content,
@@ -975,19 +1272,19 @@ async def ask_gemini(
 
 
 # ============================================================
-# SHOULD BOT ANSWER?
+# SHOULD ANSWER
 # ============================================================
 
 def should_answer(message: Message):
 
-    # Глобальный режим ВКЛ:
-    # отвечаем на всё.
+    # ВКЛ:
+    # отвечаем на все сообщения.
 
     if settings["enabled"]:
         return True
 
-    # Глобальный режим ВЫКЛ:
-    # только %
+    # ВЫКЛ:
+    # только сообщения, начинающиеся с %.
 
     text = (
         message.text
@@ -999,7 +1296,7 @@ def should_answer(message: Message):
 
 
 # ============================================================
-# REMOVE %
+# GET USER PROMPT
 # ============================================================
 
 def get_user_prompt(message: Message):
@@ -1026,8 +1323,7 @@ def get_user_prompt(message: Message):
 @dp.message()
 async def all_messages(message: Message):
 
-    # Не обрабатываем команды
-    # как обычные запросы.
+    # Команды не отправляем Gemini.
 
     if message.text and message.text.startswith("/"):
         return
@@ -1038,7 +1334,7 @@ async def all_messages(message: Message):
     ):
         return
 
-    # Проверяем глобальный режим.
+    # Проверяем режим.
 
     if not should_answer(message):
         return
@@ -1051,8 +1347,9 @@ async def all_messages(message: Message):
             message
         )
 
-        # Скачиваем медиа,
-        # если оно есть.
+        # ----------------------------------------------------
+        # MEDIA
+        # ----------------------------------------------------
 
         (
             temp_dir,
@@ -1062,34 +1359,79 @@ async def all_messages(message: Message):
             message
         )
 
-        # Если пользователь отправил
-        # только медиа.
+        # Если только файл.
 
         if not user_prompt:
 
             user_prompt = (
                 "Проанализируй предоставленный "
-                "медиафайл. Опиши подробно, "
-                "что на нём или в нём находится."
+                "медиафайл и подробно опиши "
+                "результат."
             )
 
-        # Показываем typing.
+        # ----------------------------------------------------
+        # TYPING
+        # ----------------------------------------------------
 
         await bot.send_chat_action(
             chat_id=message.chat.id,
             action="typing",
         )
 
-        # Запрос Gemini.
+        # ----------------------------------------------------
+        # GEMINI
+        # ----------------------------------------------------
 
         answer = await ask_gemini(
+            chat_id=message.chat.id,
             prompt=user_prompt,
             media_path=media_path,
             mime_type=mime_type,
         )
 
-        # Telegram позволяет максимум
-        # 4096 символов в одном сообщении.
+        # ----------------------------------------------------
+        # SAVE HISTORY
+        # ----------------------------------------------------
+
+        add_to_history(
+            chat_id=message.chat.id,
+            user_text=user_prompt,
+            assistant_text=answer,
+        )
+
+        # ----------------------------------------------------
+        # TRIM STORED HISTORY
+        # ----------------------------------------------------
+
+        limit = settings["history_limit"]
+
+        if limit > 0:
+
+            # Храним примерно столько же,
+            # сколько потенциально понадобится.
+
+            max_stored = max(
+                limit - 1,
+                0,
+            )
+
+            history = get_chat_history(
+                message.chat.id
+            )
+
+            if max_stored == 0:
+
+                history.clear()
+
+            elif len(history) > max_stored:
+
+                del history[
+                    :len(history) - max_stored
+                ]
+
+        # ----------------------------------------------------
+        # SEND RESPONSE
+        # ----------------------------------------------------
 
         for position in range(
             0,
@@ -1121,8 +1463,6 @@ async def all_messages(message: Message):
 
     finally:
 
-        # Удаляем временные файлы.
-
         if temp_dir:
 
             shutil.rmtree(
@@ -1147,7 +1487,7 @@ def escape_html(text: str) -> str:
 
 
 # ============================================================
-# START
+# MAIN
 # ============================================================
 
 async def main():
@@ -1170,6 +1510,11 @@ async def main():
 
     print(
         f"Global mode: {settings['enabled']}"
+    )
+
+    print(
+        f"History limit: "
+        f"{settings['history_limit']}"
     )
 
     print(
